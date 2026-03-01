@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Mapping of connector types to their corresponding Celery task names
 CONNECTOR_TASK_MAP = {
     SearchSourceConnectorType.SLACK_CONNECTOR: "index_slack_messages",
+    SearchSourceConnectorType.TEAMS_CONNECTOR: "index_teams_messages",
     SearchSourceConnectorType.NOTION_CONNECTOR: "index_notion_pages",
     SearchSourceConnectorType.GITHUB_CONNECTOR: "index_github_repos",
     SearchSourceConnectorType.LINEAR_CONNECTOR: "index_linear_issues",
@@ -33,6 +34,7 @@ CONNECTOR_TASK_MAP = {
     SearchSourceConnectorType.ELASTICSEARCH_CONNECTOR: "index_elasticsearch_documents",
     SearchSourceConnectorType.WEBCRAWLER_CONNECTOR: "index_crawled_urls",
     SearchSourceConnectorType.BOOKSTACK_CONNECTOR: "index_bookstack_pages",
+    SearchSourceConnectorType.OBSIDIAN_CONNECTOR: "index_obsidian_vault",
 }
 
 
@@ -42,6 +44,7 @@ def create_periodic_schedule(
     user_id: str,
     connector_type: SearchSourceConnectorType,
     frequency_minutes: int,
+    connector_config: dict | None = None,
 ) -> bool:
     """
     Trigger the first indexing run immediately when periodic indexing is enabled.
@@ -56,11 +59,26 @@ def create_periodic_schedule(
         user_id: User ID
         connector_type: Type of connector
         frequency_minutes: Frequency in minutes (used for logging)
+        connector_config: Optional connector config dict for validation
 
     Returns:
         True if successful, False otherwise
     """
     try:
+        # Special handling for connectors that require config validation
+        if connector_type == SearchSourceConnectorType.WEBCRAWLER_CONNECTOR:
+            from app.utils.webcrawler_utils import parse_webcrawler_urls
+
+            config = connector_config or {}
+            urls = parse_webcrawler_urls(config.get("INITIAL_URLS"))
+
+            if not urls:
+                logger.info(
+                    f"Webcrawler connector {connector_id} has no URLs configured, "
+                    "skipping first indexing run (will run when URLs are added)"
+                )
+                return True  # Return success - schedule is created, just no first run
+
         logger.info(
             f"Periodic indexing enabled for connector {connector_id} "
             f"(frequency: {frequency_minutes} minutes). Triggering first run..."
@@ -82,6 +100,7 @@ def create_periodic_schedule(
             index_linear_issues_task,
             index_luma_events_task,
             index_notion_pages_task,
+            index_obsidian_vault_task,
             index_slack_messages_task,
         )
 
@@ -102,6 +121,7 @@ def create_periodic_schedule(
             SearchSourceConnectorType.ELASTICSEARCH_CONNECTOR: index_elasticsearch_documents_task,
             SearchSourceConnectorType.WEBCRAWLER_CONNECTOR: index_crawled_urls_task,
             SearchSourceConnectorType.BOOKSTACK_CONNECTOR: index_bookstack_pages_task,
+            SearchSourceConnectorType.OBSIDIAN_CONNECTOR: index_obsidian_vault_task,
         }
 
         # Trigger the first run immediately

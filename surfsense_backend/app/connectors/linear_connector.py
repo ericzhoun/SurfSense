@@ -5,33 +5,229 @@ A module for retrieving issues and comments from Linear.
 Allows fetching issue lists and their comments with date range filtering.
 """
 
+import logging
 from datetime import datetime
 from typing import Any
 
-import requests
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+from app.config import config
+from app.db import SearchSourceConnector
+from app.schemas.linear_auth_credentials import LinearAuthCredentialsBase
+from app.utils.oauth_security import TokenEncryption
+
+logger = logging.getLogger(__name__)
+
+LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
+
+
+class LinearAPIError(Exception):
+    """Raised when the Linear API returns a non-200 response.
+
+    The message is always user-presentable; callers should surface it directly
+    without any additional prefix or wrapping.
+    """
+
+
+ORGANIZATION_QUERY = """
+query {
+    organization {
+        name
+    }
+}
+"""
+
+
+async def fetch_linear_organization_name(access_token: str) -> str | None:
+    """
+    Fetch organization/workspace name from Linear GraphQL API.
+
+    Args:
+        access_token: The Linear OAuth access token
+
+    Returns:
+        Organization name or None if fetch fails
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                LINEAR_GRAPHQL_URL,
+                headers={
+                    "Authorization": access_token,
+                    "Content-Type": "application/json",
+                },
+                json={"query": ORGANIZATION_QUERY},
+                timeout=10.0,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                org_name = data.get("data", {}).get("organization", {}).get("name")
+                if org_name:
+                    logger.debug(f"Fetched Linear organization name: {org_name}")
+                    return org_name
+
+            logger.warning(f"Failed to fetch Linear org info: {response.status_code}")
+            return None
+
+    except Exception as e:
+        logger.warning(f"Error fetching Linear organization name: {e!s}")
+        return None
 
 
 class LinearConnector:
     """Class for retrieving issues and comments from Linear."""
 
-    def __init__(self, token: str | None = None):
+    def __init__(
+        self,
+        session: AsyncSession,
+        connector_id: int,
+        credentials: LinearAuthCredentialsBase | None = None,
+    ):
         """
-        Initialize the LinearConnector class.
+        Initialize the LinearConnector class with auto-refresh capability.
 
         Args:
-            token: Linear API token (optional, can be set later with set_token)
+            session: Database session for updating connector
+            connector_id: Connector ID for direct updates
+            credentials: Linear OAuth credentials (optional, will be loaded from DB if not provided)
         """
-        self.token = token
+        self._session = session
+        self._connector_id = connector_id
+        self._credentials = credentials
         self.api_url = "https://api.linear.app/graphql"
 
-    def set_token(self, token: str) -> None:
+    async def _get_valid_token(self) -> str:
         """
-        Set the Linear API token.
+        Get valid Linear access token, refreshing if needed.
 
-        Args:
-            token: Linear API token
+        Returns:
+            Valid access token
+
+        Raises:
+            ValueError: If credentials are missing or invalid
+            Exception: If token refresh fails
         """
-        self.token = token
+        # Load credentials from DB if not provided
+        if self._credentials is None:
+            result = await self._session.execute(
+                select(SearchSourceConnector).filter(
+                    SearchSourceConnector.id == self._connector_id
+                )
+            )
+            connector = result.scalars().first()
+
+            if not connector:
+                raise ValueError(f"Connector {self._connector_id} not found")
+
+            config_data = connector.config.copy()
+
+            # Check if access_token exists before processing
+            raw_access_token = config_data.get("access_token")
+            if not raw_access_token:
+                raise ValueError(
+                    "Linear access token not found. "
+                    "Please reconnect your Linear account."
+                )
+
+            # Decrypt credentials if they are encrypted
+            token_encrypted = config_data.get("_token_encrypted", False)
+            if token_encrypted and config.SECRET_KEY:
+                try:
+                    token_encryption = TokenEncryption(config.SECRET_KEY)
+
+                    # Decrypt sensitive fields
+                    if config_data.get("access_token"):
+                        config_data["access_token"] = token_encryption.decrypt_token(
+                            config_data["access_token"]
+                        )
+                    if config_data.get("refresh_token"):
+                        config_data["refresh_token"] = token_encryption.decrypt_token(
+                            config_data["refresh_token"]
+                        )
+
+                    logger.info(
+                        f"Decrypted Linear credentials for connector {self._connector_id}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to decrypt Linear credentials for connector {self._connector_id}: {e!s}"
+                    )
+                    raise ValueError(
+                        f"Failed to decrypt Linear credentials: {e!s}"
+                    ) from e
+
+            # Final validation after decryption
+            final_token = config_data.get("access_token")
+            if not final_token or (
+                isinstance(final_token, str) and not final_token.strip()
+            ):
+                raise ValueError(
+                    "Linear access token is invalid or empty. "
+                    "Please reconnect your Linear account."
+                )
+
+            try:
+                self._credentials = LinearAuthCredentialsBase.from_dict(config_data)
+            except Exception as e:
+                raise ValueError(f"Invalid Linear credentials: {e!s}") from e
+
+        # Check if token is expired and refreshable
+        if self._credentials.is_expired and self._credentials.is_refreshable:
+            try:
+                logger.info(
+                    f"Linear token expired for connector {self._connector_id}, refreshing..."
+                )
+
+                # Get connector for refresh
+                result = await self._session.execute(
+                    select(SearchSourceConnector).filter(
+                        SearchSourceConnector.id == self._connector_id
+                    )
+                )
+                connector = result.scalars().first()
+
+                if not connector:
+                    raise RuntimeError(
+                        f"Connector {self._connector_id} not found; cannot refresh token."
+                    )
+
+                # Lazy import to avoid circular dependency
+                from app.routes.linear_add_connector_route import refresh_linear_token
+
+                # Refresh token
+                connector = await refresh_linear_token(self._session, connector)
+
+                # Reload credentials after refresh
+                config_data = connector.config.copy()
+                token_encrypted = config_data.get("_token_encrypted", False)
+                if token_encrypted and config.SECRET_KEY:
+                    token_encryption = TokenEncryption(config.SECRET_KEY)
+                    if config_data.get("access_token"):
+                        config_data["access_token"] = token_encryption.decrypt_token(
+                            config_data["access_token"]
+                        )
+                    if config_data.get("refresh_token"):
+                        config_data["refresh_token"] = token_encryption.decrypt_token(
+                            config_data["refresh_token"]
+                        )
+
+                self._credentials = LinearAuthCredentialsBase.from_dict(config_data)
+
+                logger.info(
+                    f"Successfully refreshed Linear token for connector {self._connector_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to refresh Linear token for connector {self._connector_id}: {e!s}"
+                )
+                raise Exception(
+                    f"Failed to refresh Linear OAuth credentials: {e!s}"
+                ) from e
+
+        return self._credentials.access_token
 
     def get_headers(self) -> dict[str, str]:
         """
@@ -41,18 +237,60 @@ class LinearConnector:
             Dictionary of headers
 
         Raises:
-            ValueError: If no Linear token has been set
+            ValueError: If no Linear access token has been set
         """
-        if not self.token:
-            raise ValueError("Linear token not initialized. Call set_token() first.")
+        # This is a synchronous method, but we need async token refresh
+        # For now, we'll raise an error if called directly
+        # All API calls should go through execute_graphql_query which handles async refresh
+        if not self._credentials or not self._credentials.access_token:
+            raise ValueError(
+                "Linear access token not initialized. Use execute_graphql_query() method."
+            )
 
-        return {"Content-Type": "application/json", "Authorization": self.token}
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._credentials.access_token}",
+        }
 
-    def execute_graphql_query(
+    @staticmethod
+    def _raise_api_error(status_code: int, body: str) -> None:
+        """Parse a non-200 Linear API response and raise a clean exception.
+
+        Translates known Linear error codes into user-readable messages so that
+        raw GraphQL payloads never reach the end user.
+        """
+        import json as _json
+
+        friendly = None
+        try:
+            payload = _json.loads(body)
+            errors = payload.get("errors", [])
+            if errors:
+                ext = errors[0].get("extensions", {})
+                code = ext.get("code", "")
+                if (
+                    code == "INPUT_ERROR"
+                    and "too complex" in errors[0].get("message", "").lower()
+                ):
+                    friendly = (
+                        "Linear rejected the request because the workspace is too large "
+                        "to fetch in one query. Please try again — if the problem persists, "
+                        "contact support."
+                    )
+                elif ext.get("userPresentableMessage"):
+                    friendly = ext["userPresentableMessage"]
+                elif errors[0].get("message"):
+                    friendly = errors[0]["message"]
+        except Exception:
+            pass
+
+        raise LinearAPIError(friendly or f"Linear API error (HTTP {status_code})")
+
+    async def execute_graphql_query(
         self, query: str, variables: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """
-        Execute a GraphQL query against the Linear API.
+        Execute a GraphQL query against the Linear API with automatic token refresh.
 
         Args:
             query: GraphQL query string
@@ -62,28 +300,35 @@ class LinearConnector:
             Response data from the API
 
         Raises:
-            ValueError: If no Linear token has been set
+            ValueError: If no Linear access token has been set
             Exception: If the API request fails
         """
-        if not self.token:
-            raise ValueError("Linear token not initialized. Call set_token() first.")
+        # Get valid token (refreshes if needed)
+        access_token = await self._get_valid_token()
 
-        headers = self.get_headers()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        }
+
         payload = {"query": query}
 
         if variables:
             payload["variables"] = variables
 
-        response = requests.post(self.api_url, headers=headers, json=payload)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.api_url, headers=headers, json=payload, timeout=30.0
+            )
 
         if response.status_code == 200:
             return response.json()
         else:
-            raise Exception(
-                f"Query failed with status code {response.status_code}: {response.text}"
-            )
+            self._raise_api_error(response.status_code, response.text)
 
-    def get_all_issues(self, include_comments: bool = True) -> list[dict[str, Any]]:
+    async def get_all_issues(
+        self, include_comments: bool = True
+    ) -> list[dict[str, Any]]:
         """
         Fetch all issues from Linear.
 
@@ -94,7 +339,7 @@ class LinearConnector:
             List of issue objects
 
         Raises:
-            ValueError: If no Linear token has been set
+            ValueError: If no Linear access token has been set
             Exception: If the API request fails
         """
         comments_query = ""
@@ -146,7 +391,7 @@ class LinearConnector:
         }}
         """
 
-        result = self.execute_graphql_query(query)
+        result = await self.execute_graphql_query(query)
 
         # Extract issues from the response
         if (
@@ -158,7 +403,7 @@ class LinearConnector:
 
         return []
 
-    def get_issues_by_date_range(
+    async def get_issues_by_date_range(
         self, start_date: str, end_date: str, include_comments: bool = True
     ) -> tuple[list[dict[str, Any]], str | None]:
         """
@@ -172,6 +417,18 @@ class LinearConnector:
         Returns:
             Tuple containing (issues list, error message or None)
         """
+        # Validate date strings
+        if not start_date or start_date.lower() in ("undefined", "null", "none"):
+            return (
+                [],
+                "Invalid start_date: must be a valid date string in YYYY-MM-DD format",
+            )
+        if not end_date or end_date.lower() in ("undefined", "null", "none"):
+            return (
+                [],
+                "Invalid end_date: must be a valid date string in YYYY-MM-DD format",
+            )
+
         # Convert date strings to ISO format
         try:
             # For Linear API: we need to use a more specific format for the filter
@@ -258,7 +515,7 @@ class LinearConnector:
                 # Handle pagination to get all issues
                 while has_next_page:
                     variables = {"after": cursor} if cursor else {}
-                    result = self.execute_graphql_query(query, variables)
+                    result = await self.execute_graphql_query(query, variables)
 
                     # Check for errors
                     if "errors" in result:
@@ -374,6 +631,148 @@ class LinearConnector:
 
         return formatted
 
+    async def create_issue(
+        self,
+        team_id: str,
+        title: str,
+        description: str | None = None,
+        state_id: str | None = None,
+        assignee_id: str | None = None,
+        priority: int | None = None,
+        label_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            mutation = """
+            mutation IssueCreate($input: IssueCreateInput!) {
+                issueCreate(input: $input) {
+                    success
+                    issue { id identifier title url }
+                }
+            }
+            """
+            input_data: dict[str, Any] = {"teamId": team_id, "title": title}
+            if description is not None:
+                input_data["description"] = description
+            if state_id is not None:
+                input_data["stateId"] = state_id
+            if assignee_id is not None:
+                input_data["assigneeId"] = assignee_id
+            if priority is not None:
+                input_data["priority"] = priority
+            if label_ids:
+                input_data["labelIds"] = label_ids
+
+            result = await self.execute_graphql_query(mutation, {"input": input_data})
+            payload = result.get("data", {}).get("issueCreate", {})
+            if not payload.get("success"):
+                errors = result.get("errors", [])
+                msg = (
+                    errors[0].get("message", "Unknown error")
+                    if errors
+                    else "Unknown error"
+                )
+                return {"status": "error", "message": f"issueCreate failed: {msg}"}
+            issue = payload.get("issue", {})
+            return {
+                "status": "success",
+                "id": issue.get("id"),
+                "identifier": issue.get("identifier"),
+                "title": issue.get("title"),
+                "url": issue.get("url"),
+                "message": f"Issue {issue.get('identifier')} created successfully.",
+            }
+        except Exception as e:
+            logger.error(f"Error creating Linear issue: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def update_issue(
+        self,
+        issue_id: str,
+        title: str | None = None,
+        description: str | None = None,
+        state_id: str | None = None,
+        assignee_id: str | None = None,
+        priority: int | None = None,
+        label_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            mutation = """
+            mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+                issueUpdate(id: $id, input: $input) {
+                    success
+                    issue { id identifier title url }
+                }
+            }
+            """
+            input_data: dict[str, Any] = {}
+            if title is not None:
+                input_data["title"] = title
+            if description is not None:
+                input_data["description"] = description
+            if state_id is not None:
+                input_data["stateId"] = state_id
+            if assignee_id is not None:
+                input_data["assigneeId"] = assignee_id
+            if priority is not None:
+                input_data["priority"] = priority
+            if label_ids is not None:
+                input_data["labelIds"] = label_ids
+
+            if not input_data:
+                return {
+                    "status": "error",
+                    "message": "No fields provided for update. Please specify at least one field to change.",
+                }
+
+            result = await self.execute_graphql_query(
+                mutation, {"id": issue_id, "input": input_data}
+            )
+            payload = result.get("data", {}).get("issueUpdate", {})
+            if not payload.get("success"):
+                errors = result.get("errors", [])
+                msg = (
+                    errors[0].get("message", "Unknown error")
+                    if errors
+                    else "Unknown error"
+                )
+                return {"status": "error", "message": f"issueUpdate failed: {msg}"}
+            issue = payload.get("issue", {})
+            return {
+                "status": "success",
+                "id": issue.get("id"),
+                "identifier": issue.get("identifier"),
+                "title": issue.get("title"),
+                "url": issue.get("url"),
+                "message": f"Issue {issue.get('identifier')} updated successfully.",
+            }
+        except Exception as e:
+            logger.error(f"Error updating Linear issue: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def archive_issue(self, issue_id: str) -> dict[str, Any]:
+        try:
+            mutation = """
+            mutation IssueArchive($id: String!) {
+                issueArchive(id: $id) {
+                    success
+                }
+            }
+            """
+            result = await self.execute_graphql_query(mutation, {"id": issue_id})
+            payload = result.get("data", {}).get("issueArchive", {})
+            if not payload.get("success"):
+                errors = result.get("errors", [])
+                msg = (
+                    errors[0].get("message", "Unknown error")
+                    if errors
+                    else "Unknown error"
+                )
+                return {"status": "error", "message": f"issueArchive failed: {msg}"}
+            return {"status": "success", "message": "Issue archived successfully."}
+        except Exception as e:
+            logger.error(f"Error archiving Linear issue: {e}")
+            return {"status": "error", "message": str(e)}
+
     def format_issue_to_markdown(self, issue: dict[str, Any]) -> str:
         """
         Convert an issue to markdown format.
@@ -446,37 +845,3 @@ class LinearConnector:
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             return iso_date
-
-
-# Example usage (uncomment to use):
-"""
-if __name__ == "__main__":
-    # Set your token here
-    token = "YOUR_LINEAR_API_KEY"
-    
-    linear = LinearConnector(token)
-    
-    try:
-        # Get all issues with comments
-        issues = linear.get_all_issues()
-        print(f"Retrieved {len(issues)} issues")
-        
-        # Format and print the first issue as markdown
-        if issues:
-            issue_md = linear.format_issue_to_markdown(issues[0])
-            print("\nSample Issue in Markdown:\n")
-            print(issue_md)
-            
-        # Get issues by date range
-        start_date = "2023-01-01"
-        end_date = "2023-01-31"
-        date_issues, error = linear.get_issues_by_date_range(start_date, end_date)
-        
-        if error:
-            print(f"Error: {error}")
-        else:
-            print(f"\nRetrieved {len(date_issues)} issues from {start_date} to {end_date}")
-    
-    except Exception as e:
-        print(f"Error: {e}")
-"""

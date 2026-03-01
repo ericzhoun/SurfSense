@@ -6,6 +6,7 @@ Allows fetching emails from Gmail mailbox using Google OAuth credentials.
 
 import base64
 import json
+import logging
 import re
 from typing import Any
 
@@ -20,6 +21,34 @@ from app.db import (
     SearchSourceConnector,
     SearchSourceConnectorType,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def fetch_google_user_email(credentials: Credentials) -> str | None:
+    """
+    Fetch user email from Gmail API using Google credentials.
+
+    Uses the Gmail users.getProfile endpoint which returns the authenticated
+    user's email address.
+
+    Args:
+        credentials: Google OAuth Credentials object (not encrypted)
+
+    Returns:
+        User's email address or None if fetch fails
+    """
+    try:
+        service = build("gmail", "v1", credentials=credentials)
+        profile = service.users().getProfile(userId="me").execute()
+        email = profile.get("emailAddress")
+        if email:
+            logger.debug(f"Fetched Google user email: {email}")
+            return email
+        return None
+    except Exception as e:
+        logger.warning(f"Error fetching Google user email: {e!s}")
+        return None
 
 
 class GoogleGmailConnector:
@@ -112,6 +141,15 @@ class GoogleGmailConnector:
                     flag_modified(connector, "config")
                     await self._session.commit()
             except Exception as e:
+                error_str = str(e)
+                # Check if this is an invalid_grant error (token expired/revoked)
+                if (
+                    "invalid_grant" in error_str.lower()
+                    or "token has been expired or revoked" in error_str.lower()
+                ):
+                    raise Exception(
+                        "Gmail authentication failed. Please re-authenticate."
+                    ) from e
                 raise Exception(
                     f"Failed to refresh Google OAuth credentials: {e!s}"
                 ) from e
@@ -135,6 +173,14 @@ class GoogleGmailConnector:
             self.service = build("gmail", "v1", credentials=credentials)
             return self.service
         except Exception as e:
+            error_str = str(e)
+            # If the error already contains a user-friendly re-authentication message, preserve it
+            if (
+                "re-authenticate" in error_str.lower()
+                or "expired or been revoked" in error_str.lower()
+                or "authentication failed" in error_str.lower()
+            ):
+                raise Exception(error_str) from e
             raise Exception(f"Failed to create Gmail service: {e!s}") from e
 
     async def get_user_profile(self) -> tuple[dict[str, Any], str | None]:
@@ -196,6 +242,14 @@ class GoogleGmailConnector:
             return messages, None
 
         except Exception as e:
+            error_str = str(e)
+            # If the error already contains a user-friendly re-authentication message, preserve it
+            if (
+                "re-authenticate" in error_str.lower()
+                or "expired or been revoked" in error_str.lower()
+                or "authentication failed" in error_str.lower()
+            ):
+                return [], error_str
             return [], f"Error fetching messages list: {e!s}"
 
     async def get_message_details(
@@ -241,6 +295,13 @@ class GoogleGmailConnector:
         """
         try:
             from datetime import datetime, timedelta
+
+            # Normalize date values - handle "undefined" strings from frontend
+            # This prevents "time data 'undefined' does not match format" errors
+            if start_date == "undefined" or start_date == "":
+                start_date = None
+            if end_date == "undefined" or end_date == "":
+                end_date = None
 
             # Build date query
             query_parts = []

@@ -43,6 +43,31 @@ if [ -z "$STT_SERVICE" ]; then
 fi
 
 # ================================================
+# Set Electric SQL configuration
+# ================================================
+export ELECTRIC_DB_USER="${ELECTRIC_DB_USER:-electric}"
+export ELECTRIC_DB_PASSWORD="${ELECTRIC_DB_PASSWORD:-electric_password}"
+if [ -z "$ELECTRIC_DATABASE_URL" ]; then
+    export ELECTRIC_DATABASE_URL="postgresql://${ELECTRIC_DB_USER}:${ELECTRIC_DB_PASSWORD}@localhost:5432/${POSTGRES_DB:-surfsense}?sslmode=disable"
+    echo "✅ Electric SQL URL configured dynamically"
+else
+    # Ensure sslmode=disable is in the URL if not already present
+    if [[ "$ELECTRIC_DATABASE_URL" != *"sslmode="* ]]; then
+        # Add sslmode=disable (handle both cases: with or without existing query params)
+        if [[ "$ELECTRIC_DATABASE_URL" == *"?"* ]]; then
+            export ELECTRIC_DATABASE_URL="${ELECTRIC_DATABASE_URL}&sslmode=disable"
+        else
+            export ELECTRIC_DATABASE_URL="${ELECTRIC_DATABASE_URL}?sslmode=disable"
+        fi
+    fi
+    echo "✅ Electric SQL URL configured from environment"
+fi
+
+# Set Electric SQL port
+export ELECTRIC_PORT="${ELECTRIC_PORT:-5133}"
+export PORT="${ELECTRIC_PORT}"
+
+# ================================================
 # Initialize PostgreSQL if needed
 # ================================================
 if [ ! -f /data/postgres/PG_VERSION ]; then
@@ -60,6 +85,11 @@ if [ ! -f /data/postgres/PG_VERSION ]; then
     echo "local all all trust" >> /data/postgres/pg_hba.conf
     echo "listen_addresses='*'" >> /data/postgres/postgresql.conf
     
+    # Enable logical replication for Electric SQL
+    echo "wal_level = logical" >> /data/postgres/postgresql.conf
+    echo "max_replication_slots = 10" >> /data/postgres/postgresql.conf
+    echo "max_wal_senders = 10" >> /data/postgres/postgresql.conf
+    
     # Start PostgreSQL temporarily to create database and user
     su - postgres -c "/usr/lib/postgresql/14/bin/pg_ctl -D /data/postgres -l /tmp/postgres_init.log start"
     
@@ -72,6 +102,35 @@ if [ ! -f /data/postgres/PG_VERSION ]; then
     
     # Enable pgvector extension
     su - postgres -c "psql -d ${POSTGRES_DB:-surfsense} -c 'CREATE EXTENSION IF NOT EXISTS vector;'"
+    
+    # Create Electric SQL replication user (idempotent - uses IF NOT EXISTS)
+    echo "📡 Creating Electric SQL replication user..."
+    su - postgres -c "psql -d ${POSTGRES_DB:-surfsense} <<-EOSQL
+        DO \\\$\\\$
+        BEGIN
+            IF NOT EXISTS (SELECT FROM pg_user WHERE usename = '${ELECTRIC_DB_USER}') THEN
+                CREATE USER ${ELECTRIC_DB_USER} WITH REPLICATION PASSWORD '${ELECTRIC_DB_PASSWORD}';
+            END IF;
+        END
+        \\\$\\\$;
+
+        GRANT CONNECT ON DATABASE ${POSTGRES_DB:-surfsense} TO ${ELECTRIC_DB_USER};
+        GRANT USAGE ON SCHEMA public TO ${ELECTRIC_DB_USER};
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${ELECTRIC_DB_USER};
+        GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO ${ELECTRIC_DB_USER};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${ELECTRIC_DB_USER};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO ${ELECTRIC_DB_USER};
+
+        -- Create the publication for Electric SQL (if not exists)
+        DO \\\$\\\$
+        BEGIN
+            IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'electric_publication_default') THEN
+                CREATE PUBLICATION electric_publication_default;
+            END IF;
+        END
+        \\\$\\\$;
+EOSQL"
+    echo "✅ Electric SQL user '${ELECTRIC_DB_USER}' created"
     
     # Stop temporary PostgreSQL
     su - postgres -c "/usr/lib/postgresql/14/bin/pg_ctl -D /data/postgres stop"
@@ -95,6 +154,38 @@ if [ -d /app/frontend/.next/standalone ]; then
     cp -r /app/frontend/.next/standalone/* /app/frontend/ 2>/dev/null || true
     cp -r /app/frontend/.next/static /app/frontend/.next/static 2>/dev/null || true
 fi
+
+# ================================================
+# Runtime Environment Variable Replacement
+# ================================================
+# Next.js NEXT_PUBLIC_* vars are baked in at build time.
+# This replaces placeholder values with actual runtime env vars.
+echo "🔧 Applying runtime environment configuration..."
+
+# Set defaults if not provided
+NEXT_PUBLIC_FASTAPI_BACKEND_URL="${NEXT_PUBLIC_FASTAPI_BACKEND_URL:-http://localhost:8000}"
+NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE="${NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE:-LOCAL}"
+NEXT_PUBLIC_ETL_SERVICE="${NEXT_PUBLIC_ETL_SERVICE:-DOCLING}"
+NEXT_PUBLIC_ELECTRIC_URL="${NEXT_PUBLIC_ELECTRIC_URL:-http://localhost:5133}"
+NEXT_PUBLIC_ELECTRIC_AUTH_MODE="${NEXT_PUBLIC_ELECTRIC_AUTH_MODE:-insecure}"
+NEXT_PUBLIC_DEPLOYMENT_MODE="${NEXT_PUBLIC_DEPLOYMENT_MODE:-self-hosted}"
+
+# Replace placeholders in all JS files
+find /app/frontend -type f \( -name "*.js" -o -name "*.json" \) -exec sed -i \
+    -e "s|__NEXT_PUBLIC_FASTAPI_BACKEND_URL__|${NEXT_PUBLIC_FASTAPI_BACKEND_URL}|g" \
+    -e "s|__NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE__|${NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE}|g" \
+    -e "s|__NEXT_PUBLIC_ETL_SERVICE__|${NEXT_PUBLIC_ETL_SERVICE}|g" \
+    -e "s|__NEXT_PUBLIC_ELECTRIC_URL__|${NEXT_PUBLIC_ELECTRIC_URL}|g" \
+    -e "s|__NEXT_PUBLIC_ELECTRIC_AUTH_MODE__|${NEXT_PUBLIC_ELECTRIC_AUTH_MODE}|g" \
+    -e "s|__NEXT_PUBLIC_DEPLOYMENT_MODE__|${NEXT_PUBLIC_DEPLOYMENT_MODE}|g" \
+    {} +
+
+echo "✅ Environment configuration applied"
+echo "   Backend URL:      ${NEXT_PUBLIC_FASTAPI_BACKEND_URL}"
+echo "   Auth Type:        ${NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE}"
+echo "   ETL Service:      ${NEXT_PUBLIC_ETL_SERVICE}"
+echo "   Electric URL:     ${NEXT_PUBLIC_ELECTRIC_URL}"
+echo "   Deployment Mode:  ${NEXT_PUBLIC_DEPLOYMENT_MODE}"
 
 # ================================================
 # Run database migrations
@@ -121,11 +212,10 @@ run_migrations() {
     echo "✅ Database migrations complete"
 }
 
-# Run migrations on first start or when explicitly requested
-if [ ! -f /data/.migrations_run ] || [ "${FORCE_MIGRATIONS:-false}" = "true" ]; then
-    run_migrations
-    touch /data/.migrations_run
-fi
+# Always run migrations on startup - alembic upgrade head is safe to run
+# every time. It only applies pending migrations (never re-runs applied ones,
+# never calls downgrade). This ensures updates are applied automatically.
+run_migrations
 
 # ================================================
 # Environment Variables Info
@@ -135,12 +225,14 @@ echo "==========================================="
 echo "  📋 Configuration"
 echo "==========================================="
 echo "  Frontend URL:    http://localhost:3000"
-echo "  Backend API:     http://localhost:8000"
-echo "  API Docs:        http://localhost:8000/docs"
-echo "  Auth Type:       ${AUTH_TYPE:-LOCAL}"
-echo "  ETL Service:     ${ETL_SERVICE:-DOCLING}"
+echo "  Backend API:     ${NEXT_PUBLIC_FASTAPI_BACKEND_URL}"
+echo "  API Docs:        ${NEXT_PUBLIC_FASTAPI_BACKEND_URL}/docs"
+echo "  Electric URL:    ${NEXT_PUBLIC_ELECTRIC_URL:-http://localhost:5133}"
+echo "  Auth Type:       ${NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE}"
+echo "  ETL Service:     ${NEXT_PUBLIC_ETL_SERVICE}"
 echo "  TTS Service:     ${TTS_SERVICE}"
 echo "  STT Service:     ${STT_SERVICE}"
+echo "  Daytona Sandbox: ${DAYTONA_SANDBOX_ENABLED:-FALSE}"
 echo "==========================================="
 echo ""
 

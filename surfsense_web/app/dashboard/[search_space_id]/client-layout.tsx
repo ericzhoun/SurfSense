@@ -1,136 +1,147 @@
 "use client";
 
-import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { Loader2, PanelRight } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
-import { activeChathatUIAtom, activeChatIdAtom } from "@/atoms/chats/ui.atoms";
-import { activeSearchSpaceIdAtom } from "@/atoms/seach-spaces/seach-space-queries.atom";
-import { ChatPanelContainer } from "@/components/chat/ChatPanel/ChatPanelContainer";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { myAccessAtom } from "@/atoms/members/members-query.atoms";
+import { updateLLMPreferencesMutationAtom } from "@/atoms/new-llm-config/new-llm-config-mutation.atoms";
+import {
+	globalNewLLMConfigsAtom,
+	llmPreferencesAtom,
+} from "@/atoms/new-llm-config/new-llm-config-query.atoms";
+import { activeSearchSpaceIdAtom } from "@/atoms/search-spaces/search-space-query.atoms";
+import { ConnectorIndicator } from "@/components/assistant-ui/connector-popup";
+import { DocumentUploadDialogProvider } from "@/components/assistant-ui/document-upload-popup";
 import { DashboardBreadcrumb } from "@/components/dashboard-breadcrumb";
-import { LanguageSwitcher } from "@/components/LanguageSwitcher";
-import { AppSidebarProvider } from "@/components/sidebar/AppSidebarProvider";
-import { ThemeTogglerComponent } from "@/components/theme/theme-toggle";
+import { LayoutDataProvider } from "@/components/layout";
+import { OnboardingTour } from "@/components/onboarding-tour";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Separator } from "@/components/ui/separator";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import { useLLMPreferences } from "@/hooks/use-llm-configs";
-import { useUserAccess } from "@/hooks/use-rbac";
-import { cn } from "@/lib/utils";
+import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
 
 export function DashboardClientLayout({
 	children,
 	searchSpaceId,
-	navSecondary,
-	navMain,
 }: {
 	children: React.ReactNode;
 	searchSpaceId: string;
-	navSecondary: any[];
-	navMain: any[];
+	navSecondary?: any[];
+	navMain?: any[];
 }) {
 	const t = useTranslations("dashboard");
 	const router = useRouter();
 	const pathname = usePathname();
-	const searchSpaceIdNum = Number(searchSpaceId);
-	const { search_space_id, chat_id } = useParams();
-	const [chatUIState, setChatUIState] = useAtom(activeChathatUIAtom);
-	const activeChatId = useAtomValue(activeChatIdAtom);
+	const { search_space_id } = useParams();
 	const setActiveSearchSpaceIdState = useSetAtom(activeSearchSpaceIdAtom);
-	const setActiveChatIdState = useSetAtom(activeChatIdAtom);
-	const [showIndicator, setShowIndicator] = useState(false);
 
-	const { isChatPannelOpen } = chatUIState;
+	const {
+		data: preferences = {},
+		isFetching: loading,
+		error,
+		refetch: refetchPreferences,
+	} = useAtomValue(llmPreferencesAtom);
+	const { data: globalConfigs = [], isFetching: globalConfigsLoading } =
+		useAtomValue(globalNewLLMConfigsAtom);
+	const { mutateAsync: updatePreferences } = useAtomValue(updateLLMPreferencesMutationAtom);
 
-	// Check if we're on the researcher page
-	const isResearcherPage = pathname?.includes("/researcher");
+	const isOnboardingComplete = useCallback(() => {
+		// Check that both LLM IDs are set (including 0 for Auto mode)
+		return (
+			preferences.agent_llm_id !== null &&
+			preferences.agent_llm_id !== undefined &&
+			preferences.document_summary_llm_id !== null &&
+			preferences.document_summary_llm_id !== undefined
+		);
+	}, [preferences]);
 
-	// Show indicator when chat becomes active and panel is closed
-	useEffect(() => {
-		if (activeChatId && !isChatPannelOpen) {
-			setShowIndicator(true);
-			// Hide indicator after 5 seconds
-			const timer = setTimeout(() => setShowIndicator(false), 5000);
-			return () => clearTimeout(timer);
-		} else {
-			setShowIndicator(false);
-		}
-	}, [activeChatId, isChatPannelOpen]);
-
-	const { loading, error, isOnboardingComplete } = useLLMPreferences(searchSpaceIdNum);
-	const { access, loading: accessLoading } = useUserAccess(searchSpaceIdNum);
+	const { data: access = null, isLoading: accessLoading } = useAtomValue(myAccessAtom);
 	const [hasCheckedOnboarding, setHasCheckedOnboarding] = useState(false);
+	const [isAutoConfiguring, setIsAutoConfiguring] = useState(false);
+	const hasAttemptedAutoConfig = useRef(false);
 
-	// Skip onboarding check if we're already on the onboarding page
 	const isOnboardingPage = pathname?.includes("/onboard");
-
-	// Only owners should see onboarding - invited members use existing config
 	const isOwner = access?.is_owner ?? false;
 
-	// Translate navigation items
-	const tNavMenu = useTranslations("nav_menu");
-	const translatedNavMain = useMemo(() => {
-		return navMain.map((item) => ({
-			...item,
-			title: tNavMenu(item.title.toLowerCase().replace(/ /g, "_")),
-			items: item.items?.map((subItem: any) => ({
-				...subItem,
-				title: tNavMenu(subItem.title.toLowerCase().replace(/ /g, "_")),
-			})),
-		}));
-	}, [navMain, tNavMenu]);
-
-	const translatedNavSecondary = useMemo(() => {
-		return navSecondary.map((item) => ({
-			...item,
-			title: item.title === "All Search Spaces" ? tNavMenu("all_search_spaces") : item.title,
-		}));
-	}, [navSecondary, tNavMenu]);
-
-	const [open, setOpen] = useState<boolean>(() => {
-		try {
-			const match = document.cookie.match(/(?:^|; )sidebar_state=([^;]+)/);
-			if (match) return match[1] === "true";
-		} catch {
-			// ignore
-		}
-		return true;
-	});
-
 	useEffect(() => {
-		// Skip check if already on onboarding page
 		if (isOnboardingPage) {
 			setHasCheckedOnboarding(true);
 			return;
 		}
 
-		// Wait for both preferences and access data to load
-		if (!loading && !accessLoading && !hasCheckedOnboarding) {
+		if (
+			!loading &&
+			!accessLoading &&
+			!globalConfigsLoading &&
+			!hasCheckedOnboarding &&
+			!isAutoConfiguring
+		) {
 			const onboardingComplete = isOnboardingComplete();
 
-			// Only redirect to onboarding if user is the owner and onboarding is not complete
-			// Invited members (non-owners) should skip onboarding and use existing config
-			if (!onboardingComplete && isOwner) {
-				router.push(`/dashboard/${searchSpaceId}/onboard`);
+			if (onboardingComplete) {
+				setHasCheckedOnboarding(true);
+				return;
 			}
 
+			if (!isOwner) {
+				setHasCheckedOnboarding(true);
+				return;
+			}
+
+			if (globalConfigs.length > 0 && !hasAttemptedAutoConfig.current) {
+				hasAttemptedAutoConfig.current = true;
+				setIsAutoConfiguring(true);
+
+				const autoConfigureWithGlobal = async () => {
+					try {
+						const firstGlobalConfig = globalConfigs[0];
+						await updatePreferences({
+							search_space_id: Number(searchSpaceId),
+							data: {
+								agent_llm_id: firstGlobalConfig.id,
+								document_summary_llm_id: firstGlobalConfig.id,
+							},
+						});
+
+						await refetchPreferences();
+
+						toast.success("AI configured automatically!", {
+							description: `Using ${firstGlobalConfig.name}. Customize in Settings.`,
+						});
+
+						setHasCheckedOnboarding(true);
+					} catch (error) {
+						console.error("Auto-configuration failed:", error);
+						router.push(`/dashboard/${searchSpaceId}/onboard`);
+					} finally {
+						setIsAutoConfiguring(false);
+					}
+				};
+
+				autoConfigureWithGlobal();
+				return;
+			}
+
+			router.push(`/dashboard/${searchSpaceId}/onboard`);
 			setHasCheckedOnboarding(true);
 		}
 	}, [
 		loading,
 		accessLoading,
+		globalConfigsLoading,
 		isOnboardingComplete,
 		isOnboardingPage,
 		isOwner,
+		isAutoConfiguring,
+		globalConfigs,
 		router,
 		searchSpaceId,
 		hasCheckedOnboarding,
+		updatePreferences,
+		refetchPreferences,
 	]);
 
-	// Synchronize active search space and chat IDs with URL
 	useEffect(() => {
 		const activeSeacrhSpaceId =
 			typeof search_space_id === "string"
@@ -140,37 +151,22 @@ export function DashboardClientLayout({
 					: "";
 		if (!activeSeacrhSpaceId) return;
 		setActiveSearchSpaceIdState(activeSeacrhSpaceId);
-	}, [search_space_id]);
+	}, [search_space_id, setActiveSearchSpaceIdState]);
 
-	useEffect(() => {
-		const activeChatId =
-			typeof chat_id === "string"
-				? chat_id
-				: Array.isArray(chat_id) && chat_id.length > 0
-					? chat_id[0]
-					: "";
-		if (!activeChatId) return;
-		setActiveChatIdState(activeChatId);
-	}, [chat_id, search_space_id]);
+	// Determine if we should show loading
+	const shouldShowLoading =
+		(!hasCheckedOnboarding &&
+			(loading || accessLoading || globalConfigsLoading) &&
+			!isOnboardingPage) ||
+		isAutoConfiguring;
 
-	// Show loading screen while checking onboarding status (only on first load)
-	if (!hasCheckedOnboarding && (loading || accessLoading) && !isOnboardingPage) {
-		return (
-			<div className="flex flex-col items-center justify-center min-h-screen space-y-4">
-				<Card className="w-[350px] bg-background/60 backdrop-blur-sm">
-					<CardHeader className="pb-2">
-						<CardTitle className="text-xl font-medium">{t("loading_config")}</CardTitle>
-						<CardDescription>{t("checking_llm_prefs")}</CardDescription>
-					</CardHeader>
-					<CardContent className="flex justify-center py-6">
-						<Loader2 className="h-12 w-12 text-primary animate-spin" />
-					</CardContent>
-				</Card>
-			</div>
-		);
+	// Use global loading screen - spinner animation won't reset
+	useGlobalLoadingEffect(shouldShowLoading);
+
+	if (shouldShowLoading) {
+		return null;
 	}
 
-	// Show error screen if there's an error loading preferences (but not on onboarding page)
 	if (error && !hasCheckedOnboarding && !isOnboardingPage) {
 		return (
 			<div className="flex flex-col items-center justify-center min-h-screen space-y-4">
@@ -182,7 +178,9 @@ export function DashboardClientLayout({
 						<CardDescription>{t("failed_load_llm_config")}</CardDescription>
 					</CardHeader>
 					<CardContent>
-						<p className="text-sm text-muted-foreground">{error}</p>
+						<p className="text-sm text-muted-foreground">
+							{error instanceof Error ? error.message : String(error)}
+						</p>
 					</CardContent>
 				</Card>
 			</div>
@@ -190,138 +188,13 @@ export function DashboardClientLayout({
 	}
 
 	return (
-		<SidebarProvider
-			className="h-full bg-red-600 overflow-hidden"
-			open={open}
-			onOpenChange={setOpen}
-		>
-			{/* Use AppSidebarProvider which fetches user, search space, and recent chats */}
-			<AppSidebarProvider
-				searchSpaceId={searchSpaceId}
-				navSecondary={translatedNavSecondary}
-				navMain={translatedNavMain}
-			/>
-			<SidebarInset className="h-full ">
-				<main className="flex h-full">
-					<div className="flex grow flex-col h-full border-r">
-						<header className="sticky top-0 z-50 flex h-16 shrink-0 items-center gap-2 bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60 border-b">
-							<div className="flex items-center justify-between w-full gap-2 px-4">
-								<div className="flex items-center gap-2">
-									<SidebarTrigger className="-ml-1" />
-									<Separator orientation="vertical" className="h-6" />
-									<DashboardBreadcrumb />
-								</div>
-								<div className="flex items-center gap-2">
-									<LanguageSwitcher />
-									<ThemeTogglerComponent />
-									{/* Only show artifacts toggle on researcher page */}
-									{isResearcherPage && (
-										<motion.div
-											className="relative"
-											animate={
-												showIndicator
-													? {
-															scale: [1, 1.05, 1],
-														}
-													: {}
-											}
-											transition={{
-												duration: 2,
-												repeat: showIndicator ? Number.POSITIVE_INFINITY : 0,
-												ease: "easeInOut",
-											}}
-										>
-											<motion.button
-												type="button"
-												onClick={() => {
-													setChatUIState((prev) => ({
-														...prev,
-														isChatPannelOpen: !isChatPannelOpen,
-													}));
-													setShowIndicator(false);
-												}}
-												className={cn(
-													"shrink-0 rounded-full p-2 transition-all duration-300 relative",
-													showIndicator
-														? "bg-primary/20 hover:bg-primary/30 shadow-lg shadow-primary/25"
-														: "hover:bg-muted",
-													activeChatId && !showIndicator && "hover:bg-primary/10"
-												)}
-												title="Toggle Artifacts Panel"
-												whileHover={{ scale: 1.05 }}
-												whileTap={{ scale: 0.95 }}
-											>
-												<motion.div
-													animate={
-														showIndicator
-															? {
-																	rotate: [0, -10, 10, -10, 0],
-																}
-															: {}
-													}
-													transition={{
-														duration: 0.5,
-														repeat: showIndicator ? Number.POSITIVE_INFINITY : 0,
-														repeatDelay: 2,
-													}}
-												>
-													<PanelRight
-														className={cn(
-															"h-4 w-4 transition-colors",
-															showIndicator && "text-primary"
-														)}
-													/>
-												</motion.div>
-											</motion.button>
-
-											{/* Pulsing indicator badge */}
-											<AnimatePresence>
-												{showIndicator && (
-													<motion.div
-														initial={{ opacity: 0, scale: 0 }}
-														animate={{ opacity: 1, scale: 1 }}
-														exit={{ opacity: 0, scale: 0 }}
-														className="absolute -right-1 -top-1 pointer-events-none"
-													>
-														<motion.div
-															animate={{
-																scale: [1, 1.3, 1],
-															}}
-															transition={{
-																duration: 1.5,
-																repeat: Number.POSITIVE_INFINITY,
-																ease: "easeInOut",
-															}}
-															className="relative"
-														>
-															<div className="h-2.5 w-2.5 rounded-full bg-primary shadow-lg" />
-															<motion.div
-																animate={{
-																	scale: [1, 2.5, 1],
-																	opacity: [0.6, 0, 0.6],
-																}}
-																transition={{
-																	duration: 1.5,
-																	repeat: Number.POSITIVE_INFINITY,
-																	ease: "easeInOut",
-																}}
-																className="absolute inset-0 h-2.5 w-2.5 rounded-full bg-primary"
-															/>
-														</motion.div>
-													</motion.div>
-												)}
-											</AnimatePresence>
-										</motion.div>
-									)}
-								</div>
-							</div>
-						</header>
-						<div className="grow flex-1 overflow-auto min-h-[calc(100vh-64px)]">{children}</div>
-					</div>
-					{/* Only render chat panel on researcher page */}
-					{isResearcherPage && <ChatPanelContainer />}
-				</main>
-			</SidebarInset>
-		</SidebarProvider>
+		<DocumentUploadDialogProvider>
+			<OnboardingTour />
+			<LayoutDataProvider searchSpaceId={searchSpaceId} breadcrumb={<DashboardBreadcrumb />}>
+				{children}
+			</LayoutDataProvider>
+			{/* Global connector dialog - triggered from documents page */}
+			<ConnectorIndicator hideTrigger />
+		</DocumentUploadDialogProvider>
 	);
 }

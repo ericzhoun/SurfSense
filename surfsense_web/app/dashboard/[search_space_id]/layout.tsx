@@ -29,45 +29,14 @@ export default function DashboardLayout({
 	const customNavMain = [
 		{
 			title: "Chat",
-			url: `/dashboard/${search_space_id}/researcher`,
-			icon: "SquareTerminal",
+			url: `/dashboard/${search_space_id}/new-chat`,
+			icon: "MessageCircle",
 			items: [],
 		},
 		{
-			title: "Sources",
-			url: "#",
-			icon: "Database",
-			items: [
-				{
-					title: "Add Sources",
-					url: `/dashboard/${search_space_id}/sources/add`,
-				},
-				{
-					title: "Manage Documents",
-					url: `/dashboard/${search_space_id}/documents`,
-				},
-				{
-					title: "Manage Connectors",
-					url: `/dashboard/${search_space_id}/connectors`,
-				},
-			],
-		},
-		{
-			title: "Team",
-			url: `/dashboard/${search_space_id}/team`,
-			icon: "Users",
-			items: [],
-		},
-		{
-			title: "Settings",
-			url: `/dashboard/${search_space_id}/settings`,
-			icon: "Settings2",
-			items: [],
-		},
-		{
-			title: "Logs",
-			url: `/dashboard/${search_space_id}/logs`,
-			icon: "FileText",
+			title: "Documents",
+			url: `/dashboard/${search_space_id}/documents`,
+			icon: "SquareLibrary",
 			items: [],
 		},
 	];

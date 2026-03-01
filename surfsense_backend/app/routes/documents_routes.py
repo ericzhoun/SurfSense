@@ -19,10 +19,16 @@ from app.db import (
 from app.schemas import (
     DocumentRead,
     DocumentsCreate,
+    DocumentStatusBatchResponse,
+    DocumentStatusItemRead,
+    DocumentStatusSchema,
+    DocumentTitleRead,
+    DocumentTitleSearchResponse,
     DocumentUpdate,
     DocumentWithChunksRead,
     PaginatedResponse,
 )
+from app.services.task_dispatcher import TaskDispatcher, get_task_dispatcher
 from app.users import current_active_user
 from app.utils.rbac import check_permission
 
@@ -38,6 +44,10 @@ os.environ["UNSTRUCTURED_HAS_PATCHED_LOOP"] = "1"
 
 
 router = APIRouter()
+
+MAX_FILES_PER_UPLOAD = 10
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB per file
+MAX_TOTAL_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB total
 
 
 @router.post("/documents")
@@ -92,7 +102,10 @@ async def create_documents(
             raise HTTPException(status_code=400, detail="Invalid document type")
 
         await session.commit()
-        return {"message": "Documents processed successfully"}
+        return {
+            "message": "Documents queued for background processing",
+            "status": "queued",
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -106,15 +119,32 @@ async def create_documents(
 async def create_documents_file_upload(
     files: list[UploadFile],
     search_space_id: int = Form(...),
+    should_summarize: bool = Form(False),
     session: AsyncSession = Depends(get_async_session),
     user: User = Depends(current_active_user),
+    dispatcher: TaskDispatcher = Depends(get_task_dispatcher),
 ):
     """
-    Upload files as documents.
+    Upload files as documents with real-time status tracking.
+
+    Implements 2-phase document status updates for real-time UI feedback:
+    - Phase 1: Create all documents with 'pending' status (visible in UI immediately via ElectricSQL)
+    - Phase 2: Celery processes each file: pending → processing → ready/failed
+
     Requires DOCUMENTS_CREATE permission.
     """
+    import os
+    import tempfile
+    from datetime import datetime
+
+    from app.db import DocumentStatus
+    from app.tasks.document_processors.base import (
+        check_document_by_unique_identifier,
+        get_current_timestamp,
+    )
+    from app.utils.document_converters import generate_unique_identifier_hash
+
     try:
-        # Check permission
         await check_permission(
             session,
             user,
@@ -126,38 +156,154 @@ async def create_documents_file_upload(
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
 
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Too many files. Maximum {MAX_FILES_PER_UPLOAD} files per upload.",
+            )
+
+        total_size = 0
         for file in files:
-            try:
-                # Save file to a temporary location to avoid stream issues
-                import os
-                import tempfile
+            file_size = file.size or 0
+            if file_size > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File '{file.filename}' ({file_size / (1024 * 1024):.1f} MB) "
+                    f"exceeds the {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB per-file limit.",
+                )
+            total_size += file_size
 
-                # Create temp file
+        if total_size > MAX_TOTAL_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Total upload size ({total_size / (1024 * 1024):.1f} MB) "
+                f"exceeds the {MAX_TOTAL_SIZE_BYTES // (1024 * 1024)} MB limit.",
+            )
+
+        # ===== Read all files concurrently to avoid blocking the event loop =====
+        async def _read_and_save(file: UploadFile) -> tuple[str, str, int]:
+            """Read upload content and write to temp file off the event loop."""
+            content = await file.read()
+            file_size = len(content)
+            filename = file.filename or "unknown"
+
+            if file_size > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File '{filename}' ({file_size / (1024 * 1024):.1f} MB) "
+                    f"exceeds the {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB per-file limit.",
+                )
+
+            def _write_temp() -> str:
                 with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=os.path.splitext(file.filename)[1]
-                ) as temp_file:
-                    temp_path = temp_file.name
+                    delete=False, suffix=os.path.splitext(filename)[1]
+                ) as tmp:
+                    tmp.write(content)
+                    return tmp.name
 
-                # Write uploaded file to temp file
-                content = await file.read()
-                with open(temp_path, "wb") as f:
-                    f.write(content)
+            temp_path = await asyncio.to_thread(_write_temp)
+            return temp_path, filename, file_size
 
-                from app.tasks.celery_tasks.document_tasks import (
-                    process_file_upload_task,
+        saved_files = await asyncio.gather(*(_read_and_save(f) for f in files))
+
+        actual_total_size = sum(size for _, _, size in saved_files)
+        if actual_total_size > MAX_TOTAL_SIZE_BYTES:
+            for temp_path, _, _ in saved_files:
+                os.unlink(temp_path)
+            raise HTTPException(
+                status_code=413,
+                detail=f"Total upload size ({actual_total_size / (1024 * 1024):.1f} MB) "
+                f"exceeds the {MAX_TOTAL_SIZE_BYTES // (1024 * 1024)} MB limit.",
+            )
+
+        # ===== PHASE 1: Create pending documents for all files =====
+        created_documents: list[Document] = []
+        files_to_process: list[tuple[Document, str, str]] = []
+        skipped_duplicates = 0
+        duplicate_document_ids: list[int] = []
+
+        for temp_path, filename, file_size in saved_files:
+            try:
+                unique_identifier_hash = generate_unique_identifier_hash(
+                    DocumentType.FILE, filename, search_space_id
                 )
 
-                process_file_upload_task.delay(
-                    temp_path, file.filename, search_space_id, str(user.id)
+                existing = await check_document_by_unique_identifier(
+                    session, unique_identifier_hash
                 )
+                if existing:
+                    if DocumentStatus.is_state(existing.status, DocumentStatus.READY):
+                        os.unlink(temp_path)
+                        skipped_duplicates += 1
+                        duplicate_document_ids.append(existing.id)
+                        continue
+
+                    existing.status = DocumentStatus.pending()
+                    existing.content = "Processing..."
+                    existing.document_metadata = {
+                        **(existing.document_metadata or {}),
+                        "file_size": file_size,
+                        "upload_time": datetime.now().isoformat(),
+                    }
+                    existing.updated_at = get_current_timestamp()
+                    created_documents.append(existing)
+                    files_to_process.append((existing, temp_path, filename))
+                    continue
+
+                document = Document(
+                    search_space_id=search_space_id,
+                    title=filename if filename != "unknown" else "Uploaded File",
+                    document_type=DocumentType.FILE,
+                    document_metadata={
+                        "FILE_NAME": filename,
+                        "file_size": file_size,
+                        "upload_time": datetime.now().isoformat(),
+                    },
+                    content="Processing...",
+                    content_hash=unique_identifier_hash,
+                    unique_identifier_hash=unique_identifier_hash,
+                    embedding=None,
+                    status=DocumentStatus.pending(),
+                    updated_at=get_current_timestamp(),
+                    created_by_id=str(user.id),
+                )
+                session.add(document)
+                created_documents.append(document)
+                files_to_process.append((document, temp_path, filename))
+
+            except HTTPException:
+                raise
             except Exception as e:
+                os.unlink(temp_path)
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Failed to process file {file.filename}: {e!s}",
+                    detail=f"Failed to process file {filename}: {e!s}",
                 ) from e
 
-        await session.commit()
-        return {"message": "Files uploaded for processing"}
+        if created_documents:
+            await session.commit()
+            for doc in created_documents:
+                await session.refresh(doc)
+
+        # ===== PHASE 2: Dispatch tasks for each file =====
+        for document, temp_path, filename in files_to_process:
+            await dispatcher.dispatch_file_processing(
+                document_id=document.id,
+                temp_path=temp_path,
+                filename=filename,
+                search_space_id=search_space_id,
+                user_id=str(user.id),
+                should_summarize=should_summarize,
+            )
+
+        return {
+            "message": "Files uploaded for processing",
+            "document_ids": [doc.id for doc in created_documents],
+            "duplicate_document_ids": duplicate_document_ids,
+            "total_files": len(files),
+            "pending_files": len(files_to_process),
+            "skipped_duplicates": skipped_duplicates,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -209,7 +355,11 @@ async def read_documents(
                 Permission.DOCUMENTS_READ.value,
                 "You don't have permission to read documents in this search space",
             )
-            query = select(Document).filter(Document.search_space_id == search_space_id)
+            query = (
+                select(Document)
+                .options(selectinload(Document.created_by))
+                .filter(Document.search_space_id == search_space_id)
+            )
             count_query = (
                 select(func.count())
                 .select_from(Document)
@@ -219,6 +369,7 @@ async def read_documents(
             # Get documents from all search spaces user has membership in
             query = (
                 select(Document)
+                .options(selectinload(Document.created_by))
                 .join(SearchSpace)
                 .join(SearchSpaceMembership)
                 .filter(SearchSpaceMembership.user_id == user.id)
@@ -259,6 +410,20 @@ async def read_documents(
         # Convert database objects to API-friendly format
         api_documents = []
         for doc in db_documents:
+            created_by_name = None
+            created_by_email = None
+            if doc.created_by:
+                created_by_name = doc.created_by.display_name
+                created_by_email = doc.created_by.email
+
+            # Parse status from JSONB
+            status_data = None
+            if hasattr(doc, "status") and doc.status:
+                status_data = DocumentStatusSchema(
+                    state=doc.status.get("state", "ready"),
+                    reason=doc.status.get("reason"),
+                )
+
             api_documents.append(
                 DocumentRead(
                     id=doc.id,
@@ -266,12 +431,31 @@ async def read_documents(
                     document_type=doc.document_type,
                     document_metadata=doc.document_metadata,
                     content=doc.content,
+                    content_hash=doc.content_hash,
+                    unique_identifier_hash=doc.unique_identifier_hash,
                     created_at=doc.created_at,
+                    updated_at=doc.updated_at,
                     search_space_id=doc.search_space_id,
+                    created_by_id=doc.created_by_id,
+                    created_by_name=created_by_name,
+                    created_by_email=created_by_email,
+                    status=status_data,
                 )
             )
 
-        return PaginatedResponse(items=api_documents, total=total)
+        # Calculate pagination info
+        actual_page = (
+            page if page is not None else (offset // page_size if page_size > 0 else 0)
+        )
+        has_more = (offset + len(api_documents)) < total if page_size > 0 else False
+
+        return PaginatedResponse(
+            items=api_documents,
+            total=total,
+            page=actual_page,
+            page_size=page_size,
+            has_more=has_more,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -324,7 +508,11 @@ async def search_documents(
                 Permission.DOCUMENTS_READ.value,
                 "You don't have permission to read documents in this search space",
             )
-            query = select(Document).filter(Document.search_space_id == search_space_id)
+            query = (
+                select(Document)
+                .options(selectinload(Document.created_by))
+                .filter(Document.search_space_id == search_space_id)
+            )
             count_query = (
                 select(func.count())
                 .select_from(Document)
@@ -334,6 +522,7 @@ async def search_documents(
             # Get documents from all search spaces user has membership in
             query = (
                 select(Document)
+                .options(selectinload(Document.created_by))
                 .join(SearchSpace)
                 .join(SearchSpaceMembership)
                 .filter(SearchSpaceMembership.user_id == user.id)
@@ -378,6 +567,20 @@ async def search_documents(
         # Convert database objects to API-friendly format
         api_documents = []
         for doc in db_documents:
+            created_by_name = None
+            created_by_email = None
+            if doc.created_by:
+                created_by_name = doc.created_by.display_name
+                created_by_email = doc.created_by.email
+
+            # Parse status from JSONB
+            status_data = None
+            if hasattr(doc, "status") and doc.status:
+                status_data = DocumentStatusSchema(
+                    state=doc.status.get("state", "ready"),
+                    reason=doc.status.get("reason"),
+                )
+
             api_documents.append(
                 DocumentRead(
                     id=doc.id,
@@ -385,17 +588,210 @@ async def search_documents(
                     document_type=doc.document_type,
                     document_metadata=doc.document_metadata,
                     content=doc.content,
+                    content_hash=doc.content_hash,
+                    unique_identifier_hash=doc.unique_identifier_hash,
                     created_at=doc.created_at,
+                    updated_at=doc.updated_at,
                     search_space_id=doc.search_space_id,
+                    created_by_id=doc.created_by_id,
+                    created_by_name=created_by_name,
+                    created_by_email=created_by_email,
+                    status=status_data,
                 )
             )
 
-        return PaginatedResponse(items=api_documents, total=total)
+        # Calculate pagination info
+        actual_page = (
+            page if page is not None else (offset // page_size if page_size > 0 else 0)
+        )
+        has_more = (offset + len(api_documents)) < total if page_size > 0 else False
+
+        return PaginatedResponse(
+            items=api_documents,
+            total=total,
+            page=actual_page,
+            page_size=page_size,
+            has_more=has_more,
+        )
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to search documents: {e!s}"
+        ) from e
+
+
+@router.get("/documents/search/titles", response_model=DocumentTitleSearchResponse)
+async def search_document_titles(
+    search_space_id: int,
+    title: str = "",
+    page: int = 0,
+    page_size: int = 20,
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """
+    Lightweight document title search optimized for mention picker (@mentions).
+
+    Returns only id, title, and document_type - no content or metadata.
+    Uses pg_trgm fuzzy search with similarity scoring for typo tolerance.
+    Results are ordered by relevance using trigram similarity scores.
+
+    Args:
+        search_space_id: The search space to search in. Required.
+        title: Search query (case-insensitive). If empty or < 2 chars, returns recent documents.
+        page: Zero-based page index. Default: 0.
+        page_size: Number of items per page. Default: 20.
+        session: Database session (injected).
+        user: Current authenticated user (injected).
+
+    Returns:
+        DocumentTitleSearchResponse: Lightweight list with has_more flag (no total count).
+    """
+    from sqlalchemy import desc, func, or_
+
+    try:
+        # Check permission for the search space
+        await check_permission(
+            session,
+            user,
+            search_space_id,
+            Permission.DOCUMENTS_READ.value,
+            "You don't have permission to read documents in this search space",
+        )
+
+        # Base query - only select lightweight fields
+        query = select(
+            Document.id,
+            Document.title,
+            Document.document_type,
+        ).filter(Document.search_space_id == search_space_id)
+
+        # If query is too short, return recent documents ordered by updated_at
+        if len(title.strip()) < 2:
+            query = query.order_by(Document.updated_at.desc().nullslast())
+        else:
+            # Fuzzy search using pg_trgm similarity + ILIKE fallback
+            search_term = title.strip()
+
+            # Similarity threshold for fuzzy matching (0.3 = ~30% trigram overlap)
+            # Lower values = more fuzzy, higher values = stricter matching
+            similarity_threshold = 0.3
+
+            # Match documents that either:
+            # 1. Have high trigram similarity (fuzzy match - handles typos)
+            # 2. Contain the exact substring (ILIKE - handles partial matches)
+            query = query.filter(
+                or_(
+                    func.similarity(Document.title, search_term) > similarity_threshold,
+                    Document.title.ilike(f"%{search_term}%"),
+                )
+            )
+
+            # Order by similarity score (descending) for best relevance ranking
+            # Higher similarity = better match = appears first
+            query = query.order_by(
+                desc(func.similarity(Document.title, search_term)),
+                Document.title,  # Alphabetical tiebreaker
+            )
+
+        # Fetch page_size + 1 to determine has_more without COUNT query
+        offset = page * page_size
+        result = await session.execute(query.offset(offset).limit(page_size + 1))
+        rows = result.all()
+
+        # Check if there are more results
+        has_more = len(rows) > page_size
+        items = rows[:page_size]  # Only return requested page_size
+
+        # Convert to response format
+        api_documents = [
+            DocumentTitleRead(
+                id=row.id,
+                title=row.title,
+                document_type=row.document_type,
+            )
+            for row in items
+        ]
+
+        return DocumentTitleSearchResponse(
+            items=api_documents,
+            has_more=has_more,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to search document titles: {e!s}"
+        ) from e
+
+
+@router.get("/documents/status", response_model=DocumentStatusBatchResponse)
+async def get_documents_status(
+    search_space_id: int,
+    document_ids: str,
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """
+    Batch status endpoint for documents in a search space.
+
+    Returns lightweight status info for the provided document IDs, intended for
+    polling async ETL progress in chat upload flows.
+    """
+    try:
+        await check_permission(
+            session,
+            user,
+            search_space_id,
+            Permission.DOCUMENTS_READ.value,
+            "You don't have permission to read documents in this search space",
+        )
+
+        # Parse comma-separated IDs (e.g. "1,2,3")
+        parsed_ids = []
+        for raw_id in document_ids.split(","):
+            value = raw_id.strip()
+            if not value:
+                continue
+            try:
+                parsed_ids.append(int(value))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid document id: {value}",
+                ) from None
+
+        if not parsed_ids:
+            return DocumentStatusBatchResponse(items=[])
+
+        result = await session.execute(
+            select(Document).filter(
+                Document.search_space_id == search_space_id,
+                Document.id.in_(parsed_ids),
+            )
+        )
+        docs = result.scalars().all()
+
+        items = [
+            DocumentStatusItemRead(
+                id=doc.id,
+                title=doc.title,
+                document_type=doc.document_type,
+                status=DocumentStatusSchema(
+                    state=(doc.status or {}).get("state", "ready"),
+                    reason=(doc.status or {}).get("reason"),
+                ),
+            )
+            for doc in docs
+        ]
+        return DocumentStatusBatchResponse(items=items)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch document status: {e!s}"
         ) from e
 
 
@@ -510,7 +906,10 @@ async def get_document_by_chunk_id(
             document_type=document.document_type,
             document_metadata=document.document_metadata,
             content=document.content,
+            content_hash=document.content_hash,
+            unique_identifier_hash=document.unique_identifier_hash,
             created_at=document.created_at,
+            updated_at=document.updated_at,
             search_space_id=document.search_space_id,
             chunks=sorted_chunks,
         )
@@ -559,7 +958,10 @@ async def read_document(
             document_type=document.document_type,
             document_metadata=document.document_metadata,
             content=document.content,
+            content_hash=document.content_hash,
+            unique_identifier_hash=document.unique_identifier_hash,
             created_at=document.created_at,
+            updated_at=document.updated_at,
             search_space_id=document.search_space_id,
         )
     except HTTPException:
@@ -614,7 +1016,10 @@ async def update_document(
             document_type=db_document.document_type,
             document_metadata=db_document.document_metadata,
             content=db_document.content,
+            content_hash=db_document.content_hash,
+            unique_identifier_hash=db_document.unique_identifier_hash,
             created_at=db_document.created_at,
+            updated_at=db_document.updated_at,
             search_space_id=db_document.search_space_id,
         )
     except HTTPException:
@@ -635,6 +1040,7 @@ async def delete_document(
     """
     Delete a document.
     Requires DOCUMENTS_DELETE permission for the search space.
+    Documents in "processing" state cannot be deleted.
     """
     try:
         result = await session.execute(
@@ -645,6 +1051,14 @@ async def delete_document(
         if not document:
             raise HTTPException(
                 status_code=404, detail=f"Document with id {document_id} not found"
+            )
+
+        # Check if document is pending or currently being processed
+        doc_state = document.status.get("state") if document.status else None
+        if doc_state in ("pending", "processing"):
+            raise HTTPException(
+                status_code=409,  # Conflict
+                detail="Cannot delete document while it is pending or being processed. Please wait for processing to complete.",
             )
 
         # Check permission for the search space

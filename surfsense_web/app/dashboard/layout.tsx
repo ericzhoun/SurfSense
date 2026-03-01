@@ -1,9 +1,7 @@
 "use client";
 
-import { Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { AnnouncementBanner } from "@/components/announcement-banner";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
 import { getBearerToken, redirectToLogin } from "@/lib/auth-utils";
 
 interface DashboardLayoutProps {
@@ -12,6 +10,9 @@ interface DashboardLayoutProps {
 
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
 	const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+
+	// Use the global loading screen - spinner animation won't reset
+	useGlobalLoadingEffect(isCheckingAuth);
 
 	useEffect(() => {
 		// Check if user is authenticated
@@ -24,26 +25,13 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 		setIsCheckingAuth(false);
 	}, []);
 
-	// Show loading screen while checking authentication
+	// Return null while loading - the global provider handles the loading UI
 	if (isCheckingAuth) {
-		return (
-			<div className="flex flex-col items-center justify-center min-h-screen space-y-4">
-				<Card className="w-[350px] bg-background/60 backdrop-blur-sm">
-					<CardHeader className="pb-2">
-						<CardTitle className="text-xl font-medium">Loading Dashboard</CardTitle>
-						<CardDescription>Checking authentication...</CardDescription>
-					</CardHeader>
-					<CardContent className="flex justify-center py-6">
-						<Loader2 className="h-12 w-12 text-primary animate-spin" />
-					</CardContent>
-				</Card>
-			</div>
-		);
+		return null;
 	}
 
 	return (
 		<div className="h-full flex flex-col ">
-			<AnnouncementBanner />
 			<div className="flex-1 min-h-0">{children}</div>
 		</div>
 	);

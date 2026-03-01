@@ -1,5 +1,5 @@
-import type z from "zod";
-import { getBearerToken, handleUnauthorized } from "../auth-utils";
+import type { ZodType } from "zod";
+import { getBearerToken, handleUnauthorized, refreshAccessToken } from "../auth-utils";
 import { AppError, AuthenticationError, AuthorizationError, NotFoundError } from "../error";
 
 enum ResponseType {
@@ -11,33 +11,42 @@ enum ResponseType {
 }
 
 export type RequestOptions = {
-	method: "GET" | "POST" | "PUT" | "DELETE";
+	method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 	headers?: Record<string, string>;
 	contentType?: "application/json" | "application/x-www-form-urlencoded";
 	signal?: AbortSignal;
 	body?: any;
 	responseType?: ResponseType;
+	_isRetry?: boolean; // Internal flag to prevent infinite retry loops
 	// Add more options as needed
 };
 
 class BaseApiService {
-	bearerToken: string;
 	baseUrl: string;
 
-	noAuthEndpoints: string[] = ["/auth/jwt/login", "/auth/register", "/auth/refresh"]; // Add more endpoints as needed
+	noAuthEndpoints: string[] = ["/auth/jwt/login", "/auth/register", "/auth/refresh"];
 
-	constructor(bearerToken: string, baseUrl: string) {
-		this.bearerToken = bearerToken;
+	// Prefixes that don't require auth (checked with startsWith)
+	noAuthPrefixes: string[] = ["/api/v1/public/"];
+
+	// Use a getter to always read fresh token from localStorage
+	// This ensures the token is always up-to-date after login/logout
+	get bearerToken(): string {
+		return typeof window !== "undefined" ? getBearerToken() || "" : "";
+	}
+
+	constructor(baseUrl: string) {
 		this.baseUrl = baseUrl;
 	}
 
-	setBearerToken(bearerToken: string) {
-		this.bearerToken = bearerToken;
+	// Keep for backward compatibility, but token is now always read from localStorage
+	setBearerToken(_bearerToken: string) {
+		// No-op: token is now always read fresh from localStorage via the getter
 	}
 
 	async request<T, R extends ResponseType = ResponseType.JSON>(
 		url: string,
-		responseSchema?: z.ZodSchema<T>,
+		responseSchema?: ZodType<T>,
 		options?: RequestOptions & { responseType?: R }
 	): Promise<
 		R extends ResponseType.JSON
@@ -58,7 +67,6 @@ class BaseApiService {
 			 */
 			const defaultOptions: RequestOptions = {
 				headers: {
-					"Content-Type": "application/json",
 					Authorization: `Bearer ${this.bearerToken || ""}`,
 				},
 				method: "GET",
@@ -80,7 +88,10 @@ class BaseApiService {
 			}
 
 			// Validate the bearer token
-			if (!this.bearerToken && !this.noAuthEndpoints.includes(url)) {
+			const isNoAuthEndpoint =
+				this.noAuthEndpoints.includes(url) ||
+				this.noAuthPrefixes.some((prefix) => url.startsWith(prefix));
+			if (!this.bearerToken && !isNoAuthEndpoint) {
 				throw new AuthenticationError("You are not authenticated. Please login again.");
 			}
 
@@ -125,20 +136,39 @@ class BaseApiService {
 					throw new AppError("Failed to parse response", response.status, response.statusText);
 				}
 
+				// Handle 401 - try to refresh token first (only once)
+				if (response.status === 401) {
+					if (!options?._isRetry) {
+						const newToken = await refreshAccessToken();
+						if (newToken) {
+							// Retry the request with the new token
+							return this.request(url, responseSchema, {
+								...mergedOptions,
+								headers: {
+									...mergedOptions.headers,
+									Authorization: `Bearer ${newToken}`,
+								},
+								_isRetry: true,
+							} as RequestOptions & { responseType?: R });
+						}
+					}
+					// Refresh failed or retry failed, redirect to login
+					handleUnauthorized();
+					throw new AuthenticationError(
+						typeof data === "object" && "detail" in data
+							? data.detail
+							: "You are not authenticated. Please login again.",
+						response.status,
+						response.statusText
+					);
+				}
+
 				// For fastapi errors response
 				if (typeof data === "object" && "detail" in data) {
 					throw new AppError(data.detail, response.status, response.statusText);
 				}
 
 				switch (response.status) {
-					case 401:
-						// Use centralized auth handler for 401 responses
-						handleUnauthorized();
-						throw new AuthenticationError(
-							"You are not authenticated. Please login again.",
-							response.status,
-							response.statusText
-						);
 					case 403:
 						throw new AuthorizationError(
 							"You don't have permission to access this resource.",
@@ -207,23 +237,29 @@ class BaseApiService {
 
 	async get<T>(
 		url: string,
-		responseSchema?: z.ZodSchema<T>,
+		responseSchema?: ZodType<T>,
 		options?: Omit<RequestOptions, "method" | "responseType">
 	) {
 		return this.request(url, responseSchema, {
-			...options,
 			method: "GET",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			...options,
 			responseType: ResponseType.JSON,
 		});
 	}
 
 	async post<T>(
 		url: string,
-		responseSchema?: z.ZodSchema<T>,
+		responseSchema?: ZodType<T>,
 		options?: Omit<RequestOptions, "method" | "responseType">
 	) {
 		return this.request(url, responseSchema, {
 			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
 			...options,
 			responseType: ResponseType.JSON,
 		});
@@ -231,11 +267,14 @@ class BaseApiService {
 
 	async put<T>(
 		url: string,
-		responseSchema?: z.ZodSchema<T>,
+		responseSchema?: ZodType<T>,
 		options?: Omit<RequestOptions, "method" | "responseType">
 	) {
 		return this.request(url, responseSchema, {
 			method: "PUT",
+			headers: {
+				"Content-Type": "application/json",
+			},
 			...options,
 			responseType: ResponseType.JSON,
 		});
@@ -243,11 +282,29 @@ class BaseApiService {
 
 	async delete<T>(
 		url: string,
-		responseSchema?: z.ZodSchema<T>,
+		responseSchema?: ZodType<T>,
 		options?: Omit<RequestOptions, "method" | "responseType">
 	) {
 		return this.request(url, responseSchema, {
 			method: "DELETE",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			...options,
+			responseType: ResponseType.JSON,
+		});
+	}
+
+	async patch<T>(
+		url: string,
+		responseSchema?: ZodType<T>,
+		options?: Omit<RequestOptions, "method" | "responseType">
+	) {
+		return this.request(url, responseSchema, {
+			method: "PATCH",
+			headers: {
+				"Content-Type": "application/json",
+			},
 			...options,
 			responseType: ResponseType.JSON,
 		});
@@ -260,9 +317,26 @@ class BaseApiService {
 			responseType: ResponseType.BLOB,
 		});
 	}
+
+	async postFormData<T>(
+		url: string,
+		responseSchema?: ZodType<T>,
+		options?: Omit<RequestOptions, "method" | "responseType" | "body"> & { body: FormData }
+	) {
+		// Remove Content-Type from options headers if present
+		const { "Content-Type": _, ...headersWithoutContentType } = options?.headers ?? {};
+
+		return this.request(url, responseSchema, {
+			method: "POST",
+			...options,
+			headers: {
+				// Don't set Content-Type - let browser set it with multipart boundary
+				Authorization: `Bearer ${this.bearerToken}`,
+				...headersWithoutContentType,
+			},
+			responseType: ResponseType.JSON,
+		});
+	}
 }
 
-export const baseApiService = new BaseApiService(
-	typeof window !== "undefined" ? getBearerToken() || "" : "",
-	process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || ""
-);
+export const baseApiService = new BaseApiService(process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "");

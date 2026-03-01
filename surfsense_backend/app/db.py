@@ -1,7 +1,9 @@
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 
+import anyio
 from fastapi import Depends
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID, SQLAlchemyUserDatabase
 from pgvector.sqlalchemy import Vector
@@ -9,7 +11,6 @@ from sqlalchemy import (
     ARRAY,
     JSON,
     TIMESTAMP,
-    BigInteger,
     Boolean,
     Column,
     Enum as SQLAlchemyEnum,
@@ -25,8 +26,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, relationship
 
 from app.config import config
-from app.retriever.chunks_hybrid_search import ChucksHybridSearchRetriever
-from app.retriever.documents_hybrid_search import DocumentHybridSearchRetriever
 
 if config.AUTH_TYPE == "GOOGLE":
     from fastapi_users.db import SQLAlchemyBaseOAuthAccountTableUUID
@@ -34,11 +33,12 @@ if config.AUTH_TYPE == "GOOGLE":
 DATABASE_URL = config.DATABASE_URL
 
 
-class DocumentType(str, Enum):
+class DocumentType(StrEnum):
     EXTENSION = "EXTENSION"
     CRAWLED_URL = "CRAWLED_URL"
     FILE = "FILE"
     SLACK_CONNECTOR = "SLACK_CONNECTOR"
+    TEAMS_CONNECTOR = "TEAMS_CONNECTOR"
     NOTION_CONNECTOR = "NOTION_CONNECTOR"
     YOUTUBE_VIDEO = "YOUTUBE_VIDEO"
     GITHUB_CONNECTOR = "GITHUB_CONNECTOR"
@@ -49,19 +49,27 @@ class DocumentType(str, Enum):
     CLICKUP_CONNECTOR = "CLICKUP_CONNECTOR"
     GOOGLE_CALENDAR_CONNECTOR = "GOOGLE_CALENDAR_CONNECTOR"
     GOOGLE_GMAIL_CONNECTOR = "GOOGLE_GMAIL_CONNECTOR"
+    GOOGLE_DRIVE_FILE = "GOOGLE_DRIVE_FILE"
     AIRTABLE_CONNECTOR = "AIRTABLE_CONNECTOR"
     LUMA_CONNECTOR = "LUMA_CONNECTOR"
     ELASTICSEARCH_CONNECTOR = "ELASTICSEARCH_CONNECTOR"
     BOOKSTACK_CONNECTOR = "BOOKSTACK_CONNECTOR"
+    CIRCLEBACK = "CIRCLEBACK"
+    OBSIDIAN_CONNECTOR = "OBSIDIAN_CONNECTOR"
+    NOTE = "NOTE"
+    COMPOSIO_GOOGLE_DRIVE_CONNECTOR = "COMPOSIO_GOOGLE_DRIVE_CONNECTOR"
+    COMPOSIO_GMAIL_CONNECTOR = "COMPOSIO_GMAIL_CONNECTOR"
+    COMPOSIO_GOOGLE_CALENDAR_CONNECTOR = "COMPOSIO_GOOGLE_CALENDAR_CONNECTOR"
 
 
-class SearchSourceConnectorType(str, Enum):
+class SearchSourceConnectorType(StrEnum):
     SERPER_API = "SERPER_API"  # NOT IMPLEMENTED YET : DON'T REMEMBER WHY : MOST PROBABLY BECAUSE WE NEED TO CRAWL THE RESULTS RETURNED BY IT
     TAVILY_API = "TAVILY_API"
     SEARXNG_API = "SEARXNG_API"
     LINKUP_API = "LINKUP_API"
     BAIDU_SEARCH_API = "BAIDU_SEARCH_API"  # Baidu AI Search API for Chinese web search
     SLACK_CONNECTOR = "SLACK_CONNECTOR"
+    TEAMS_CONNECTOR = "TEAMS_CONNECTOR"
     NOTION_CONNECTOR = "NOTION_CONNECTOR"
     GITHUB_CONNECTOR = "GITHUB_CONNECTOR"
     LINEAR_CONNECTOR = "LINEAR_CONNECTOR"
@@ -71,18 +79,107 @@ class SearchSourceConnectorType(str, Enum):
     CLICKUP_CONNECTOR = "CLICKUP_CONNECTOR"
     GOOGLE_CALENDAR_CONNECTOR = "GOOGLE_CALENDAR_CONNECTOR"
     GOOGLE_GMAIL_CONNECTOR = "GOOGLE_GMAIL_CONNECTOR"
+    GOOGLE_DRIVE_CONNECTOR = "GOOGLE_DRIVE_CONNECTOR"
     AIRTABLE_CONNECTOR = "AIRTABLE_CONNECTOR"
     LUMA_CONNECTOR = "LUMA_CONNECTOR"
     ELASTICSEARCH_CONNECTOR = "ELASTICSEARCH_CONNECTOR"
     WEBCRAWLER_CONNECTOR = "WEBCRAWLER_CONNECTOR"
     BOOKSTACK_CONNECTOR = "BOOKSTACK_CONNECTOR"
+    CIRCLEBACK_CONNECTOR = "CIRCLEBACK_CONNECTOR"
+    OBSIDIAN_CONNECTOR = (
+        "OBSIDIAN_CONNECTOR"  # Self-hosted only - Local Obsidian vault indexing
+    )
+    MCP_CONNECTOR = "MCP_CONNECTOR"  # Model Context Protocol - User-defined API tools
+    COMPOSIO_GOOGLE_DRIVE_CONNECTOR = "COMPOSIO_GOOGLE_DRIVE_CONNECTOR"
+    COMPOSIO_GMAIL_CONNECTOR = "COMPOSIO_GMAIL_CONNECTOR"
+    COMPOSIO_GOOGLE_CALENDAR_CONNECTOR = "COMPOSIO_GOOGLE_CALENDAR_CONNECTOR"
 
 
-class ChatType(str, Enum):
-    QNA = "QNA"
+class PodcastStatus(StrEnum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    READY = "ready"
+    FAILED = "failed"
 
 
-class LiteLLMProvider(str, Enum):
+class DocumentStatus:
+    """
+    Helper class for document processing status (stored as JSONB).
+
+    Status values:
+    - {"state": "ready"} - Document is fully processed and searchable
+    - {"state": "pending"} - Document is queued, waiting to be processed
+    - {"state": "processing"} - Document is currently being processed (only 1 at a time)
+    - {"state": "failed", "reason": "..."} - Processing failed with reason
+
+    Usage:
+        document.status = DocumentStatus.pending()
+        document.status = DocumentStatus.processing()
+        document.status = DocumentStatus.ready()
+        document.status = DocumentStatus.failed("LLM rate limit exceeded")
+    """
+
+    # State constants
+    READY = "ready"
+    PENDING = "pending"
+    PROCESSING = "processing"
+    FAILED = "failed"
+
+    @staticmethod
+    def ready() -> dict:
+        """Return status dict for a ready/searchable document."""
+        return {"state": DocumentStatus.READY}
+
+    @staticmethod
+    def pending() -> dict:
+        """Return status dict for a document waiting to be processed."""
+        return {"state": DocumentStatus.PENDING}
+
+    @staticmethod
+    def processing() -> dict:
+        """Return status dict for a document being processed."""
+        return {"state": DocumentStatus.PROCESSING}
+
+    @staticmethod
+    def failed(reason: str, **extra_details) -> dict:
+        """
+        Return status dict for a failed document.
+
+        Args:
+            reason: Human-readable failure reason
+            **extra_details: Optional additional details (duplicate_of, error_code, etc.)
+        """
+        status = {
+            "state": DocumentStatus.FAILED,
+            "reason": reason[:500],
+        }  # Truncate long reasons
+        if extra_details:
+            status.update(extra_details)
+        return status
+
+    @staticmethod
+    def get_state(status: dict | None) -> str | None:
+        """Extract state from status dict, returns None if invalid."""
+        if status is None:
+            return None
+        return status.get("state") if isinstance(status, dict) else None
+
+    @staticmethod
+    def is_state(status: dict | None, state: str) -> bool:
+        """Check if status matches a given state."""
+        return DocumentStatus.get_state(status) == state
+
+    @staticmethod
+    def get_failure_reason(status: dict | None) -> str | None:
+        """Extract failure reason from status dict."""
+        if status is None or not isinstance(status, dict):
+            return None
+        if status.get("state") == DocumentStatus.FAILED:
+            return status.get("reason")
+        return None
+
+
+class LiteLLMProvider(StrEnum):
     """
     Enum for LLM providers supported by LiteLLM.
     """
@@ -116,10 +213,29 @@ class LiteLLMProvider(str, Enum):
     DATABRICKS = "DATABRICKS"
     COMETAPI = "COMETAPI"
     HUGGINGFACE = "HUGGINGFACE"
+    GITHUB_MODELS = "GITHUB_MODELS"
     CUSTOM = "CUSTOM"
 
 
-class LogLevel(str, Enum):
+class ImageGenProvider(StrEnum):
+    """
+    Enum for image generation providers supported by LiteLLM.
+    This is a subset of LLM providers — only those that support image generation.
+    See: https://docs.litellm.ai/docs/image_generation#supported-providers
+    """
+
+    OPENAI = "OPENAI"
+    AZURE_OPENAI = "AZURE_OPENAI"
+    GOOGLE = "GOOGLE"  # Google AI Studio
+    VERTEX_AI = "VERTEX_AI"
+    BEDROCK = "BEDROCK"  # AWS Bedrock
+    RECRAFT = "RECRAFT"
+    OPENROUTER = "OPENROUTER"
+    XINFERENCE = "XINFERENCE"
+    NSCALE = "NSCALE"
+
+
+class LogLevel(StrEnum):
     DEBUG = "DEBUG"
     INFO = "INFO"
     WARNING = "WARNING"
@@ -127,13 +243,64 @@ class LogLevel(str, Enum):
     CRITICAL = "CRITICAL"
 
 
-class LogStatus(str, Enum):
+class LogStatus(StrEnum):
     IN_PROGRESS = "IN_PROGRESS"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
 
 
-class Permission(str, Enum):
+class IncentiveTaskType(StrEnum):
+    """
+    Enum for incentive task types that users can complete to earn free pages.
+    Each task can only be completed once per user.
+
+    When adding new tasks:
+    1. Add a new enum value here
+    2. Add the task configuration to INCENTIVE_TASKS_CONFIG below
+    3. Create an Alembic migration to add the enum value to PostgreSQL
+    """
+
+    GITHUB_STAR = "GITHUB_STAR"
+    REDDIT_FOLLOW = "REDDIT_FOLLOW"
+    DISCORD_JOIN = "DISCORD_JOIN"
+    # Future tasks can be added here:
+    # GITHUB_ISSUE = "GITHUB_ISSUE"
+    # SOCIAL_SHARE = "SOCIAL_SHARE"
+    # REFER_FRIEND = "REFER_FRIEND"
+
+
+# Centralized configuration for incentive tasks
+# This makes it easy to add new tasks without changing code in multiple places
+INCENTIVE_TASKS_CONFIG = {
+    IncentiveTaskType.GITHUB_STAR: {
+        "title": "Star our GitHub repository",
+        "description": "Show your support by starring SurfSense on GitHub",
+        "pages_reward": 30,
+        "action_url": "https://github.com/MODSetter/SurfSense",
+    },
+    IncentiveTaskType.REDDIT_FOLLOW: {
+        "title": "Join our Subreddit",
+        "description": "Join the SurfSense community on Reddit",
+        "pages_reward": 30,
+        "action_url": "https://www.reddit.com/r/SurfSense/",
+    },
+    IncentiveTaskType.DISCORD_JOIN: {
+        "title": "Join our Discord",
+        "description": "Join the SurfSense community on Discord",
+        "pages_reward": 40,
+        "action_url": "https://discord.gg/ejRNvftDp9",
+    },
+    # Future tasks can be configured here:
+    # IncentiveTaskType.GITHUB_ISSUE: {
+    #     "title": "Create an issue",
+    #     "description": "Help improve SurfSense by reporting bugs or suggesting features",
+    #     "pages_reward": 50,
+    #     "action_url": "https://github.com/MODSetter/SurfSense/issues/new/choose",
+    # },
+}
+
+
+class Permission(StrEnum):
     """
     Granular permissions for search space resources.
     Use '*' (FULL_ACCESS) to grant all permissions.
@@ -151,6 +318,11 @@ class Permission(str, Enum):
     CHATS_UPDATE = "chats:update"
     CHATS_DELETE = "chats:delete"
 
+    # Comments
+    COMMENTS_CREATE = "comments:create"
+    COMMENTS_READ = "comments:read"
+    COMMENTS_DELETE = "comments:delete"
+
     # LLM Configs
     LLM_CONFIGS_CREATE = "llm_configs:create"
     LLM_CONFIGS_READ = "llm_configs:read"
@@ -162,6 +334,11 @@ class Permission(str, Enum):
     PODCASTS_READ = "podcasts:read"
     PODCASTS_UPDATE = "podcasts:update"
     PODCASTS_DELETE = "podcasts:delete"
+
+    # Image Generations
+    IMAGE_GENERATIONS_CREATE = "image_generations:create"
+    IMAGE_GENERATIONS_READ = "image_generations:read"
+    IMAGE_GENERATIONS_DELETE = "image_generations:delete"
 
     # Connectors
     CONNECTORS_CREATE = "connectors:create"
@@ -190,98 +367,74 @@ class Permission(str, Enum):
     SETTINGS_UPDATE = "settings:update"
     SETTINGS_DELETE = "settings:delete"  # Delete the entire search space
 
+    # Public Sharing
+    PUBLIC_SHARING_VIEW = "public_sharing:view"
+    PUBLIC_SHARING_CREATE = "public_sharing:create"
+    PUBLIC_SHARING_DELETE = "public_sharing:delete"
+
     # Full access wildcard
     FULL_ACCESS = "*"
 
 
 # Predefined role permission sets for convenience
+# Note: Only Owner, Editor, and Viewer roles are supported.
+# Owner has full access (*), Editor can do everything except delete, Viewer has read-only access.
 DEFAULT_ROLE_PERMISSIONS = {
     "Owner": [Permission.FULL_ACCESS.value],
-    "Admin": [
-        # Documents
+    "Editor": [
+        # Documents (no delete)
         Permission.DOCUMENTS_CREATE.value,
         Permission.DOCUMENTS_READ.value,
         Permission.DOCUMENTS_UPDATE.value,
-        Permission.DOCUMENTS_DELETE.value,
-        # Chats
+        # Chats (no delete)
         Permission.CHATS_CREATE.value,
         Permission.CHATS_READ.value,
         Permission.CHATS_UPDATE.value,
-        Permission.CHATS_DELETE.value,
-        # LLM Configs
+        # Comments (no delete)
+        Permission.COMMENTS_CREATE.value,
+        Permission.COMMENTS_READ.value,
+        # LLM Configs (no delete)
         Permission.LLM_CONFIGS_CREATE.value,
         Permission.LLM_CONFIGS_READ.value,
         Permission.LLM_CONFIGS_UPDATE.value,
-        Permission.LLM_CONFIGS_DELETE.value,
-        # Podcasts
+        # Podcasts (no delete)
         Permission.PODCASTS_CREATE.value,
         Permission.PODCASTS_READ.value,
         Permission.PODCASTS_UPDATE.value,
-        Permission.PODCASTS_DELETE.value,
-        # Connectors
+        # Image Generations (create and read, no delete)
+        Permission.IMAGE_GENERATIONS_CREATE.value,
+        Permission.IMAGE_GENERATIONS_READ.value,
+        # Connectors (no delete)
         Permission.CONNECTORS_CREATE.value,
         Permission.CONNECTORS_READ.value,
         Permission.CONNECTORS_UPDATE.value,
-        Permission.CONNECTORS_DELETE.value,
-        # Logs
+        # Logs (read only)
         Permission.LOGS_READ.value,
-        Permission.LOGS_DELETE.value,
-        # Members
+        # Members (can invite and view only, cannot manage roles or remove)
         Permission.MEMBERS_INVITE.value,
         Permission.MEMBERS_VIEW.value,
-        Permission.MEMBERS_REMOVE.value,
-        Permission.MEMBERS_MANAGE_ROLES.value,
-        # Roles
-        Permission.ROLES_CREATE.value,
+        # Roles (read only - cannot create, update, or delete)
         Permission.ROLES_READ.value,
-        Permission.ROLES_UPDATE.value,
-        Permission.ROLES_DELETE.value,
-        # Settings (no delete)
+        # Settings (view only, no update or delete)
         Permission.SETTINGS_VIEW.value,
-        Permission.SETTINGS_UPDATE.value,
-    ],
-    "Editor": [
-        # Documents
-        Permission.DOCUMENTS_CREATE.value,
-        Permission.DOCUMENTS_READ.value,
-        Permission.DOCUMENTS_UPDATE.value,
-        Permission.DOCUMENTS_DELETE.value,
-        # Chats
-        Permission.CHATS_CREATE.value,
-        Permission.CHATS_READ.value,
-        Permission.CHATS_UPDATE.value,
-        Permission.CHATS_DELETE.value,
-        # LLM Configs (read only)
-        Permission.LLM_CONFIGS_READ.value,
-        Permission.LLM_CONFIGS_CREATE.value,
-        Permission.LLM_CONFIGS_UPDATE.value,
-        # Podcasts
-        Permission.PODCASTS_CREATE.value,
-        Permission.PODCASTS_READ.value,
-        Permission.PODCASTS_UPDATE.value,
-        Permission.PODCASTS_DELETE.value,
-        # Connectors (full access for editors)
-        Permission.CONNECTORS_CREATE.value,
-        Permission.CONNECTORS_READ.value,
-        Permission.CONNECTORS_UPDATE.value,
-        # Logs
-        Permission.LOGS_READ.value,
-        # Members (view only)
-        Permission.MEMBERS_VIEW.value,
-        # Roles (read only)
-        Permission.ROLES_READ.value,
-        # Settings (view only)
-        Permission.SETTINGS_VIEW.value,
+        # Public Sharing (can create and view, no delete)
+        Permission.PUBLIC_SHARING_VIEW.value,
+        Permission.PUBLIC_SHARING_CREATE.value,
     ],
     "Viewer": [
         # Documents (read only)
         Permission.DOCUMENTS_READ.value,
         # Chats (read only)
         Permission.CHATS_READ.value,
+        # Comments (can create and read, but not delete)
+        Permission.COMMENTS_CREATE.value,
+        Permission.COMMENTS_READ.value,
         # LLM Configs (read only)
         Permission.LLM_CONFIGS_READ.value,
         # Podcasts (read only)
         Permission.PODCASTS_READ.value,
+        # Image Generations (read only)
+        Permission.IMAGE_GENERATIONS_READ.value,
         # Connectors (read only)
         Permission.CONNECTORS_READ.value,
         # Logs (read only)
@@ -292,6 +445,8 @@ DEFAULT_ROLE_PERMISSIONS = {
         Permission.ROLES_READ.value,
         # Settings (view only)
         Permission.SETTINGS_VIEW.value,
+        # Public Sharing (view only)
+        Permission.PUBLIC_SHARING_VIEW.value,
     ],
 }
 
@@ -318,19 +473,414 @@ class BaseModel(Base):
     id = Column(Integer, primary_key=True, index=True)
 
 
-class Chat(BaseModel, TimestampMixin):
-    __tablename__ = "chats"
+class NewChatMessageRole(StrEnum):
+    """Role enum for new chat messages."""
 
-    type = Column(SQLAlchemyEnum(ChatType), nullable=False)
-    title = Column(String, nullable=False, index=True)
-    initial_connectors = Column(ARRAY(String), nullable=True)
-    messages = Column(JSON, nullable=False)
-    state_version = Column(BigInteger, nullable=False, default=1)
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
 
+
+class ChatVisibility(StrEnum):
+    """
+    Visibility/sharing level for chat threads.
+
+    PRIVATE: Only the creator can see/access the chat (default)
+    SEARCH_SPACE: All members of the search space can see/access the chat
+    PUBLIC: (Future) Anyone with the link can access the chat
+    """
+
+    PRIVATE = "PRIVATE"
+    SEARCH_SPACE = "SEARCH_SPACE"
+    # PUBLIC = "PUBLIC"  # Reserved for future implementation
+
+
+class NewChatThread(BaseModel, TimestampMixin):
+    """
+    Thread model for the new chat feature using assistant-ui.
+    Each thread represents a conversation with message history.
+    LangGraph checkpointer uses thread_id for state persistence.
+    """
+
+    __tablename__ = "new_chat_threads"
+
+    title = Column(String(500), nullable=False, default="New Chat", index=True)
+    archived = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    # Visibility/sharing control
+    visibility = Column(
+        SQLAlchemyEnum(ChatVisibility),
+        nullable=False,
+        default=ChatVisibility.PRIVATE,
+        server_default="PRIVATE",
+        index=True,
+    )
+
+    # Foreign keys
     search_space_id = Column(
         Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
     )
-    search_space = relationship("SearchSpace", back_populates="chats")
+
+    # Track who created this chat thread (for visibility filtering)
+    created_by_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,  # Nullable for existing records before migration
+        index=True,
+    )
+
+    # Clone tracking - for audit and history bootstrap
+    cloned_from_thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    cloned_from_snapshot_id = Column(
+        Integer,
+        ForeignKey("public_chat_snapshots.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    cloned_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+    )
+    # Flag to bootstrap LangGraph checkpointer with DB messages on first message
+    needs_history_bootstrap = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+
+    # Relationships
+    search_space = relationship("SearchSpace", back_populates="new_chat_threads")
+    created_by = relationship("User", back_populates="new_chat_threads")
+    messages = relationship(
+        "NewChatMessage",
+        back_populates="thread",
+        order_by="NewChatMessage.created_at",
+        cascade="all, delete-orphan",
+    )
+    snapshots = relationship(
+        "PublicChatSnapshot",
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        foreign_keys="[PublicChatSnapshot.thread_id]",
+    )
+
+
+class NewChatMessage(BaseModel, TimestampMixin):
+    """
+    Message model for the new chat feature.
+    Stores individual messages in assistant-ui format.
+    """
+
+    __tablename__ = "new_chat_messages"
+
+    role = Column(SQLAlchemyEnum(NewChatMessageRole), nullable=False)
+    # Content stored as JSONB to support rich content (text, tool calls, etc.)
+    content = Column(JSONB, nullable=False)
+
+    # Foreign key to thread
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Track who sent this message (for shared chats)
+    author_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Relationships
+    thread = relationship("NewChatThread", back_populates="messages")
+    author = relationship("User")
+    comments = relationship(
+        "ChatComment",
+        back_populates="message",
+        cascade="all, delete-orphan",
+    )
+
+
+class PublicChatSnapshot(BaseModel, TimestampMixin):
+    """
+    Immutable snapshot of a chat thread for public sharing.
+
+    Each snapshot is a frozen copy of the chat at a specific point in time.
+    The snapshot_data JSONB contains all messages and metadata needed to
+    render the public chat without querying the original thread.
+    """
+
+    __tablename__ = "public_chat_snapshots"
+
+    # Link to original thread - CASCADE DELETE when thread is deleted
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Public access token (unique URL identifier)
+    share_token = Column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    content_hash = Column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+
+    snapshot_data = Column(JSONB, nullable=False)
+
+    message_ids = Column(ARRAY(Integer), nullable=False)
+
+    created_by_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Relationships
+    thread = relationship(
+        "NewChatThread",
+        back_populates="snapshots",
+        foreign_keys="[PublicChatSnapshot.thread_id]",
+    )
+    created_by = relationship("User")
+
+    # Constraints
+    __table_args__ = (
+        # Prevent duplicate snapshots of the same content for the same thread
+        UniqueConstraint(
+            "thread_id", "content_hash", name="uq_snapshot_thread_content_hash"
+        ),
+    )
+
+
+class ChatComment(BaseModel, TimestampMixin):
+    """
+    Comment model for comments on AI chat responses.
+    Supports one level of nesting (replies to comments, but no replies to replies).
+    """
+
+    __tablename__ = "chat_comments"
+
+    message_id = Column(
+        Integer,
+        ForeignKey("new_chat_messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalized thread_id for efficient Electric SQL subscriptions (one per thread)
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    parent_id = Column(
+        Integer,
+        ForeignKey("chat_comments.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    author_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    content = Column(Text, nullable=False)
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    # Relationships
+    message = relationship("NewChatMessage", back_populates="comments")
+    thread = relationship("NewChatThread")
+    author = relationship("User")
+    parent = relationship(
+        "ChatComment", remote_side="ChatComment.id", backref="replies"
+    )
+    mentions = relationship(
+        "ChatCommentMention",
+        back_populates="comment",
+        cascade="all, delete-orphan",
+    )
+
+
+class ChatCommentMention(BaseModel, TimestampMixin):
+    """
+    Tracks @mentions in chat comments for notification purposes.
+    """
+
+    __tablename__ = "chat_comment_mentions"
+
+    comment_id = Column(
+        Integer,
+        ForeignKey("chat_comments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    mentioned_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Relationships
+    comment = relationship("ChatComment", back_populates="mentions")
+    mentioned_user = relationship("User")
+
+
+class ChatSessionState(BaseModel):
+    """
+    Tracks real-time session state for shared chat collaboration.
+    One record per thread, synced via Electric SQL.
+    """
+
+    __tablename__ = "chat_session_state"
+
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    ai_responding_to_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    thread = relationship("NewChatThread")
+    ai_responding_to_user = relationship("User")
+
+
+class MemoryCategory(StrEnum):
+    """Categories for user memories."""
+
+    # Using lowercase keys to match PostgreSQL enum values
+    preference = "preference"  # User preferences (e.g., "prefers dark mode")
+    fact = "fact"  # Facts about the user (e.g., "is a Python developer")
+    instruction = (
+        "instruction"  # Standing instructions (e.g., "always respond in bullet points")
+    )
+    context = "context"  # Contextual information (e.g., "working on project X")
+
+
+class UserMemory(BaseModel, TimestampMixin):
+    """
+    Private memory: facts, preferences, context per user per search space.
+    Used only for private chats (not shared/team chats).
+    """
+
+    __tablename__ = "user_memories"
+
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Optional association with a search space (if memory is space-specific)
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    # The actual memory content
+    memory_text = Column(Text, nullable=False)
+    # Category for organization and filtering
+    category = Column(
+        SQLAlchemyEnum(MemoryCategory),
+        nullable=False,
+        default=MemoryCategory.fact,
+    )
+    # Vector embedding for semantic search
+    embedding = Column(Vector(config.embedding_model_instance.dimension))
+
+    # Track when memory was last updated
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    # Relationships
+    user = relationship("User", back_populates="memories")
+    search_space = relationship("SearchSpace", back_populates="user_memories")
+
+
+class SharedMemory(BaseModel, TimestampMixin):
+    __tablename__ = "shared_memories"
+
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_by_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    memory_text = Column(Text, nullable=False)
+    category = Column(
+        SQLAlchemyEnum(MemoryCategory),
+        nullable=False,
+        default=MemoryCategory.fact,
+    )
+    embedding = Column(Vector(config.embedding_model_instance.dimension))
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    search_space = relationship("SearchSpace", back_populates="shared_memories")
+    created_by = relationship("User")
 
 
 class Document(BaseModel, TimestampMixin):
@@ -346,20 +896,57 @@ class Document(BaseModel, TimestampMixin):
     embedding = Column(Vector(config.embedding_model_instance.dimension))
 
     # BlockNote live editing state (NULL when never edited)
+    # DEPRECATED: Will be removed in a future migration. Use source_markdown instead.
     blocknote_document = Column(JSONB, nullable=True)
 
-    # blocknote background reindex flag
+    # Full raw markdown content for the Plate.js editor.
+    # This is the source of truth for document content in the editor.
+    # Populated from markdown at ingestion time, or from blocknote_document migration.
+    source_markdown = Column(Text, nullable=True)
+
+    # Background reindex flag (set when editor content is saved)
     content_needs_reindexing = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
 
-    # Track when blocknote document was last edited
-    last_edited_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    # Track when document was last updated by indexers, processors, or editor
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
 
     search_space_id = Column(
         Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
     )
+
+    # Track who created/uploaded this document
+    created_by_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,  # Nullable for backward compatibility with existing records
+        index=True,
+    )
+
+    # Track which connector created this document (for cleanup on connector deletion)
+    connector_id = Column(
+        Integer,
+        ForeignKey("search_source_connectors.id", ondelete="SET NULL"),
+        nullable=True,  # Nullable for manually uploaded docs without connector
+        index=True,
+    )
+
+    # Processing status for real-time visibility (JSONB)
+    # Format: {"state": "ready"} or {"state": "processing"} or {"state": "failed", "reason": "..."}
+    # Default to {"state": "ready"} for backward compatibility with existing documents
+    status = Column(
+        JSONB,
+        nullable=False,
+        default=DocumentStatus.ready,
+        server_default=text('\'{"state": "ready"}\'::jsonb'),
+        index=True,
+    )
+
+    # Relationships
     search_space = relationship("SearchSpace", back_populates="documents")
+    created_by = relationship("User", back_populates="documents")
+    connector = relationship("SearchSourceConnector", back_populates="documents")
     chunks = relationship(
         "Chunk", back_populates="document", cascade="all, delete-orphan"
     )
@@ -377,21 +964,212 @@ class Chunk(BaseModel, TimestampMixin):
     document = relationship("Document", back_populates="chunks")
 
 
+class SurfsenseDocsDocument(BaseModel, TimestampMixin):
+    """
+    Surfsense documentation storage.
+    Indexed at migration time from MDX files.
+    """
+
+    __tablename__ = "surfsense_docs_documents"
+
+    source = Column(
+        String, nullable=False, unique=True, index=True
+    )  # File path: "connectors/slack.mdx"
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    content_hash = Column(String, nullable=False, index=True)  # For detecting changes
+    embedding = Column(Vector(config.embedding_model_instance.dimension))
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)
+
+    chunks = relationship(
+        "SurfsenseDocsChunk",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+
+
+class SurfsenseDocsChunk(BaseModel, TimestampMixin):
+    """Chunk storage for Surfsense documentation."""
+
+    __tablename__ = "surfsense_docs_chunks"
+
+    content = Column(Text, nullable=False)
+    embedding = Column(Vector(config.embedding_model_instance.dimension))
+
+    document_id = Column(
+        Integer,
+        ForeignKey("surfsense_docs_documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    document = relationship("SurfsenseDocsDocument", back_populates="chunks")
+
+
 class Podcast(BaseModel, TimestampMixin):
+    """Podcast model for storing generated podcasts."""
+
     __tablename__ = "podcasts"
 
-    title = Column(String, nullable=False, index=True)
-    podcast_transcript = Column(JSON, nullable=False, default={})
-    file_location = Column(String(500), nullable=False, default="")
-    chat_id = Column(
-        Integer, ForeignKey("chats.id", ondelete="CASCADE"), nullable=True
-    )  # If generated from a chat, this will be the chat id, else null ( can be from a document or a chat )
-    chat_state_version = Column(BigInteger, nullable=True)
+    title = Column(String(500), nullable=False)
+    podcast_transcript = Column(JSONB, nullable=True)
+    file_location = Column(Text, nullable=True)
+    status = Column(
+        SQLAlchemyEnum(
+            PodcastStatus,
+            name="podcast_status",
+            create_type=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
+        nullable=False,
+        default=PodcastStatus.READY,
+        server_default="ready",
+        index=True,
+    )
 
     search_space_id = Column(
         Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
     )
     search_space = relationship("SearchSpace", back_populates="podcasts")
+
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    thread = relationship("NewChatThread")
+
+
+class Report(BaseModel, TimestampMixin):
+    """Report model for storing generated Markdown reports."""
+
+    __tablename__ = "reports"
+
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=True)  # Markdown body
+    report_metadata = Column(JSONB, nullable=True)  # section headings, word count, etc.
+    report_style = Column(
+        String(100), nullable=True
+    )  # e.g. "executive_summary", "deep_research"
+
+    search_space_id = Column(
+        Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    search_space = relationship("SearchSpace", back_populates="reports")
+
+    # Versioning: reports sharing the same report_group_id are versions of the same report.
+    # For v1, report_group_id = the report's own id (set after insert).
+    report_group_id = Column(Integer, nullable=True, index=True)
+
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    thread = relationship("NewChatThread")
+
+
+class ImageGenerationConfig(BaseModel, TimestampMixin):
+    """
+    Dedicated configuration table for image generation models.
+
+    Separate from NewLLMConfig because image generation models don't need
+    system_instructions, citations_enabled, or use_default_system_instructions.
+    They only need provider credentials and model parameters.
+    """
+
+    __tablename__ = "image_generation_configs"
+
+    name = Column(String(100), nullable=False, index=True)
+    description = Column(String(500), nullable=True)
+
+    # Provider & model (uses ImageGenProvider, NOT LiteLLMProvider)
+    provider = Column(SQLAlchemyEnum(ImageGenProvider), nullable=False)
+    custom_provider = Column(String(100), nullable=True)
+    model_name = Column(String(100), nullable=False)
+
+    # Credentials
+    api_key = Column(String, nullable=False)
+    api_base = Column(String(500), nullable=True)
+    api_version = Column(String(50), nullable=True)  # Azure-specific
+
+    # Additional litellm parameters
+    litellm_params = Column(JSON, nullable=True, default={})
+
+    # Relationships
+    search_space_id = Column(
+        Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    search_space = relationship(
+        "SearchSpace", back_populates="image_generation_configs"
+    )
+
+    # User who created this config
+    user_id = Column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    user = relationship("User", back_populates="image_generation_configs")
+
+
+class ImageGeneration(BaseModel, TimestampMixin):
+    """
+    Stores image generation requests and results using litellm.aimage_generation().
+
+    Since aimage_generation is a single async call (not a background job),
+    there is no status enum. A row with response_data means success;
+    a row with error_message means failure.
+
+    Response data is stored as JSONB matching the litellm output format:
+    {
+        "created": int,
+        "data": [{"b64_json": str|None, "revised_prompt": str|None, "url": str|None}],
+        "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+    }
+    """
+
+    __tablename__ = "image_generations"
+
+    # Request parameters (matching litellm.aimage_generation() params)
+    prompt = Column(Text, nullable=False)
+    model = Column(String(200), nullable=True)  # e.g., "dall-e-3", "gpt-image-1"
+    n = Column(Integer, nullable=True, default=1)
+    quality = Column(
+        String(50), nullable=True
+    )  # "auto", "high", "medium", "low", "hd", "standard"
+    size = Column(
+        String(50), nullable=True
+    )  # "1024x1024", "1536x1024", "1024x1536", etc.
+    style = Column(String(50), nullable=True)  # Model-specific style parameter
+    response_format = Column(String(50), nullable=True)  # "url" or "b64_json"
+
+    # Image generation config reference
+    # 0 = Auto mode (router), negative IDs = global configs from YAML,
+    # positive IDs = ImageGenerationConfig records in DB
+    image_generation_config_id = Column(Integer, nullable=True)
+
+    # Response data (full litellm response as JSONB) — present on success
+    response_data = Column(JSONB, nullable=True)
+    # Error message — present on failure
+    error_message = Column(Text, nullable=True)
+
+    # Signed access token for serving images via <img> tags.
+    # Stored in DB so it survives SECRET_KEY rotation.
+    access_token = Column(String(64), nullable=True, index=True)
+
+    # Foreign keys
+    search_space_id = Column(
+        Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    created_by_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Relationships
+    search_space = relationship("SearchSpace", back_populates="image_generations")
+    created_by = relationship("User", back_populates="image_generations")
 
 
 class SearchSpace(BaseModel, TimestampMixin):
@@ -408,10 +1186,19 @@ class SearchSpace(BaseModel, TimestampMixin):
     )  # User's custom instructions
 
     # Search space-level LLM preferences (shared by all members)
-    # Note: These can be negative IDs for global configs (from YAML) or positive IDs for custom configs (from DB)
-    long_context_llm_id = Column(Integer, nullable=True)
-    fast_llm_id = Column(Integer, nullable=True)
-    strategic_llm_id = Column(Integer, nullable=True)
+    # Note: ID values:
+    #   - 0: Auto mode (uses LiteLLM Router for load balancing) - default for new search spaces
+    #   - Negative IDs: Global configs from YAML
+    #   - Positive IDs: Custom configs from DB (NewLLMConfig table)
+    agent_llm_id = Column(
+        Integer, nullable=True, default=0
+    )  # For agent/chat operations, defaults to Auto mode
+    document_summary_llm_id = Column(
+        Integer, nullable=True, default=0
+    )  # For document summarization, defaults to Auto mode
+    image_generation_config_id = Column(
+        Integer, nullable=True, default=0
+    )  # For image generation, defaults to Auto mode
 
     user_id = Column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False
@@ -424,16 +1211,28 @@ class SearchSpace(BaseModel, TimestampMixin):
         order_by="Document.id",
         cascade="all, delete-orphan",
     )
+    new_chat_threads = relationship(
+        "NewChatThread",
+        back_populates="search_space",
+        order_by="NewChatThread.updated_at.desc()",
+        cascade="all, delete-orphan",
+    )
     podcasts = relationship(
         "Podcast",
         back_populates="search_space",
-        order_by="Podcast.id",
+        order_by="Podcast.id.desc()",
         cascade="all, delete-orphan",
     )
-    chats = relationship(
-        "Chat",
+    reports = relationship(
+        "Report",
         back_populates="search_space",
-        order_by="Chat.id",
+        order_by="Report.id.desc()",
+        cascade="all, delete-orphan",
+    )
+    image_generations = relationship(
+        "ImageGeneration",
+        back_populates="search_space",
+        order_by="ImageGeneration.id.desc()",
         cascade="all, delete-orphan",
     )
     logs = relationship(
@@ -442,16 +1241,28 @@ class SearchSpace(BaseModel, TimestampMixin):
         order_by="Log.id",
         cascade="all, delete-orphan",
     )
+    notifications = relationship(
+        "Notification",
+        back_populates="search_space",
+        order_by="Notification.created_at.desc()",
+        cascade="all, delete-orphan",
+    )
     search_source_connectors = relationship(
         "SearchSourceConnector",
         back_populates="search_space",
         order_by="SearchSourceConnector.id",
         cascade="all, delete-orphan",
     )
-    llm_configs = relationship(
-        "LLMConfig",
+    new_llm_configs = relationship(
+        "NewLLMConfig",
         back_populates="search_space",
-        order_by="LLMConfig.id",
+        order_by="NewLLMConfig.id",
+        cascade="all, delete-orphan",
+    )
+    image_generation_configs = relationship(
+        "ImageGenerationConfig",
+        back_populates="search_space",
+        order_by="ImageGenerationConfig.id",
         cascade="all, delete-orphan",
     )
 
@@ -475,6 +1286,20 @@ class SearchSpace(BaseModel, TimestampMixin):
         cascade="all, delete-orphan",
     )
 
+    # User memories associated with this search space
+    user_memories = relationship(
+        "UserMemory",
+        back_populates="search_space",
+        order_by="UserMemory.updated_at.desc()",
+        cascade="all, delete-orphan",
+    )
+    shared_memories = relationship(
+        "SharedMemory",
+        back_populates="search_space",
+        order_by="SharedMemory.updated_at.desc()",
+        cascade="all, delete-orphan",
+    )
+
 
 class SearchSourceConnector(BaseModel, TimestampMixin):
     __tablename__ = "search_source_connectors"
@@ -483,7 +1308,8 @@ class SearchSourceConnector(BaseModel, TimestampMixin):
             "search_space_id",
             "user_id",
             "connector_type",
-            name="uq_searchspace_user_connector_type",
+            "name",
+            name="uq_searchspace_user_connector_type_name",
         ),
     )
 
@@ -492,6 +1318,12 @@ class SearchSourceConnector(BaseModel, TimestampMixin):
     is_indexable = Column(Boolean, nullable=False, default=False)
     last_indexed_at = Column(TIMESTAMP(timezone=True), nullable=True)
     config = Column(JSON, nullable=False)
+
+    # Summary generation (LLM-based) - disabled by default to save resources.
+    # When enabled, improves hybrid search quality at the cost of LLM calls.
+    enable_summary = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # Periodic indexing fields
     periodic_indexing_enabled = Column(Boolean, nullable=False, default=False)
@@ -508,12 +1340,30 @@ class SearchSourceConnector(BaseModel, TimestampMixin):
     user_id = Column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False
     )
+    user = relationship("User", back_populates="search_source_connectors")
+
+    # Documents created by this connector (for cleanup on connector deletion)
+    documents = relationship("Document", back_populates="connector")
 
 
-class LLMConfig(BaseModel, TimestampMixin):
-    __tablename__ = "llm_configs"
+class NewLLMConfig(BaseModel, TimestampMixin):
+    """
+    New LLM configuration table that combines model settings with prompt configuration.
+
+    This table provides:
+    - LLM model configuration (provider, model_name, api_key, etc.)
+    - Configurable system instructions (defaults to SURFSENSE_SYSTEM_INSTRUCTIONS)
+    - Citation toggle (enable/disable citation instructions)
+
+    Note: Tools instructions are built by get_tools_instructions(thread_visibility) (personal vs shared memory).
+    """
+
+    __tablename__ = "new_llm_configs"
 
     name = Column(String(100), nullable=False, index=True)
+    description = Column(String(500), nullable=True)
+
+    # === LLM Model Configuration (from original LLMConfig, excluding 'language') ===
     # Provider from the enum
     provider = Column(SQLAlchemyEnum(LiteLLMProvider), nullable=False)
     # Custom provider name when provider is CUSTOM
@@ -523,16 +1373,35 @@ class LLMConfig(BaseModel, TimestampMixin):
     # API Key should be encrypted before storing
     api_key = Column(String, nullable=False)
     api_base = Column(String(500), nullable=True)
-
-    language = Column(String(50), nullable=True, default="English")
-
     # For any other parameters that litellm supports
     litellm_params = Column(JSON, nullable=True, default={})
 
+    # === Prompt Configuration ===
+    # Configurable system instructions (defaults to SURFSENSE_SYSTEM_INSTRUCTIONS)
+    # Users can customize this from the UI
+    system_instructions = Column(
+        Text,
+        nullable=False,
+        default="",  # Empty string means use default SURFSENSE_SYSTEM_INSTRUCTIONS
+    )
+    # Whether to use the default system instructions when system_instructions is empty
+    use_default_system_instructions = Column(Boolean, nullable=False, default=True)
+
+    # Citation toggle - when enabled, SURFSENSE_CITATION_INSTRUCTIONS is injected
+    # When disabled, an anti-citation prompt is injected instead
+    citations_enabled = Column(Boolean, nullable=False, default=True)
+
+    # === Relationships ===
     search_space_id = Column(
         Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
     )
-    search_space = relationship("SearchSpace", back_populates="llm_configs")
+    search_space = relationship("SearchSpace", back_populates="new_llm_configs")
+
+    # User who created this config
+    user_id = Column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    user = relationship("User", back_populates="new_llm_configs")
 
 
 class Log(BaseModel, TimestampMixin):
@@ -550,6 +1419,72 @@ class Log(BaseModel, TimestampMixin):
         Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=False
     )
     search_space = relationship("SearchSpace", back_populates="logs")
+
+
+class Notification(BaseModel, TimestampMixin):
+    __tablename__ = "notifications"
+
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    search_space_id = Column(
+        Integer, ForeignKey("searchspaces.id", ondelete="CASCADE"), nullable=True
+    )
+    type = Column(
+        String(50), nullable=False
+    )  # 'connector_indexing', 'document_processing', etc.
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    read = Column(
+        Boolean, nullable=False, default=False, server_default=text("false"), index=True
+    )
+    notification_metadata = Column("metadata", JSONB, nullable=True, default={})
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    user = relationship("User", back_populates="notifications")
+    search_space = relationship("SearchSpace", back_populates="notifications")
+
+
+class UserIncentiveTask(BaseModel, TimestampMixin):
+    """
+    Tracks completed incentive tasks for users.
+    Each user can only complete each task type once.
+    When a task is completed, the user's pages_limit is increased.
+    """
+
+    __tablename__ = "user_incentive_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "task_type",
+            name="uq_user_incentive_task",
+        ),
+    )
+
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_type = Column(SQLAlchemyEnum(IncentiveTaskType), nullable=False, index=True)
+    pages_awarded = Column(Integer, nullable=False)
+    completed_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+
+    user = relationship("User", back_populates="incentive_tasks")
 
 
 class SearchSpaceRole(BaseModel, TimestampMixin):
@@ -573,7 +1508,7 @@ class SearchSpaceRole(BaseModel, TimestampMixin):
     permissions = Column(ARRAY(String), nullable=False, default=[])
     # Whether this role is assigned to new members by default when they join via invite
     is_default = Column(Boolean, nullable=False, default=False)
-    # System roles (Owner, Admin, Editor, Viewer) cannot be deleted
+    # System roles (Owner, Editor, Viewer) cannot be deleted
     is_system_role = Column(Boolean, nullable=False, default=False)
 
     search_space_id = Column(
@@ -696,6 +1631,12 @@ if config.AUTH_TYPE == "GOOGLE":
             "OAuthAccount", lazy="joined"
         )
         search_spaces = relationship("SearchSpace", back_populates="user")
+        notifications = relationship(
+            "Notification",
+            back_populates="user",
+            order_by="Notification.created_at.desc()",
+            cascade="all, delete-orphan",
+        )
 
         # RBAC relationships
         search_space_memberships = relationship(
@@ -709,14 +1650,93 @@ if config.AUTH_TYPE == "GOOGLE":
             passive_deletes=True,
         )
 
+        # Chat threads created by this user
+        new_chat_threads = relationship(
+            "NewChatThread",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Documents created/uploaded by this user
+        documents = relationship(
+            "Document",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Image generations created by this user
+        image_generations = relationship(
+            "ImageGeneration",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Connectors created by this user
+        search_source_connectors = relationship(
+            "SearchSourceConnector",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # LLM configs created by this user
+        new_llm_configs = relationship(
+            "NewLLMConfig",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # Image generation configs created by this user
+        image_generation_configs = relationship(
+            "ImageGenerationConfig",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # User memories for personalized AI responses
+        memories = relationship(
+            "UserMemory",
+            back_populates="user",
+            order_by="UserMemory.updated_at.desc()",
+            cascade="all, delete-orphan",
+        )
+
+        # Incentive tasks completed by this user
+        incentive_tasks = relationship(
+            "UserIncentiveTask",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
+
         # Page usage tracking for ETL services
-        pages_limit = Column(Integer, nullable=False, default=500, server_default="500")
+        pages_limit = Column(
+            Integer,
+            nullable=False,
+            default=config.PAGES_LIMIT,
+            server_default=str(config.PAGES_LIMIT),
+        )
         pages_used = Column(Integer, nullable=False, default=0, server_default="0")
+
+        # User profile from OAuth
+        display_name = Column(String, nullable=True)
+        avatar_url = Column(String, nullable=True)
+
+        # Refresh tokens for this user
+        refresh_tokens = relationship(
+            "RefreshToken",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
 
 else:
 
     class User(SQLAlchemyBaseUserTableUUID, Base):
         search_spaces = relationship("SearchSpace", back_populates="user")
+        notifications = relationship(
+            "Notification",
+            back_populates="user",
+            order_by="Notification.created_at.desc()",
+            cascade="all, delete-orphan",
+        )
 
         # RBAC relationships
         search_space_memberships = relationship(
@@ -730,13 +1750,143 @@ else:
             passive_deletes=True,
         )
 
+        # Chat threads created by this user
+        new_chat_threads = relationship(
+            "NewChatThread",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Documents created/uploaded by this user
+        documents = relationship(
+            "Document",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Image generations created by this user
+        image_generations = relationship(
+            "ImageGeneration",
+            back_populates="created_by",
+            passive_deletes=True,
+        )
+
+        # Connectors created by this user
+        search_source_connectors = relationship(
+            "SearchSourceConnector",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # LLM configs created by this user
+        new_llm_configs = relationship(
+            "NewLLMConfig",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # Image generation configs created by this user
+        image_generation_configs = relationship(
+            "ImageGenerationConfig",
+            back_populates="user",
+            passive_deletes=True,
+        )
+
+        # User memories for personalized AI responses
+        memories = relationship(
+            "UserMemory",
+            back_populates="user",
+            order_by="UserMemory.updated_at.desc()",
+            cascade="all, delete-orphan",
+        )
+
+        # Incentive tasks completed by this user
+        incentive_tasks = relationship(
+            "UserIncentiveTask",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
+
         # Page usage tracking for ETL services
-        pages_limit = Column(Integer, nullable=False, default=500, server_default="500")
+        pages_limit = Column(
+            Integer,
+            nullable=False,
+            default=config.PAGES_LIMIT,
+            server_default=str(config.PAGES_LIMIT),
+        )
         pages_used = Column(Integer, nullable=False, default=0, server_default="0")
 
+        # User profile (can be set manually for non-OAuth users)
+        display_name = Column(String, nullable=True)
+        avatar_url = Column(String, nullable=True)
 
-engine = create_async_engine(DATABASE_URL)
+        # Refresh tokens for this user
+        refresh_tokens = relationship(
+            "RefreshToken",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
+
+
+class RefreshToken(Base, TimestampMixin):
+    """
+    Stores refresh tokens for user session management.
+    Each row represents one device/session.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user = relationship("User", back_populates="refresh_tokens")
+    token_hash = Column(String(256), unique=True, nullable=False, index=True)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False, index=True)
+    is_revoked = Column(Boolean, default=False, nullable=False)
+    family_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now(UTC) >= self.expires_at
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.is_expired and not self.is_revoked
+
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=30,
+    max_overflow=150,
+    pool_recycle=1800,
+    pool_pre_ping=True,
+    pool_timeout=30,
+)
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+
+@asynccontextmanager
+async def shielded_async_session():
+    """Cancellation-safe async session context manager.
+
+    Starlette's BaseHTTPMiddleware cancels the task via an anyio cancel
+    scope when a client disconnects.  A plain ``async with async_session_maker()``
+    has its ``__aexit__`` (which awaits ``session.close()``) cancelled by the
+    scope, orphaning the underlying database connection.
+
+    This wrapper ensures ``session.close()`` always completes by running it
+    inside ``anyio.CancelScope(shield=True)``.
+    """
+    session = async_session_maker()
+    try:
+        yield session
+    finally:
+        with anyio.CancelScope(shield=True):
+            await session.close()
 
 
 async def setup_indexes():
@@ -764,11 +1914,36 @@ async def setup_indexes():
                 "CREATE INDEX IF NOT EXISTS chucks_search_index ON chunks USING gin (to_tsvector('english', content))"
             )
         )
+        # pg_trgm indexes for efficient ILIKE '%term%' searches on titles
+        # Critical for document mention picker (@mentions) to scale
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops)"
+            )
+        )
+        # B-tree index on search_space_id for fast filtering
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_documents_search_space_id ON documents (search_space_id)"
+            )
+        )
+        # Covering index for "recent documents" query - enables index-only scan
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_documents_search_space_updated ON documents (search_space_id, updated_at DESC NULLS LAST) INCLUDE (id, title, document_type)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_surfsense_docs_title_trgm ON surfsense_docs_documents USING gin (title gin_trgm_ops)"
+            )
+        )
 
 
 async def create_db_and_tables():
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
     await setup_indexes()
 
@@ -787,18 +1962,6 @@ else:
 
     async def get_user_db(session: AsyncSession = Depends(get_async_session)):
         yield SQLAlchemyUserDatabase(session, User)
-
-
-async def get_chucks_hybrid_search_retriever(
-    session: AsyncSession = Depends(get_async_session),
-):
-    return ChucksHybridSearchRetriever(session)
-
-
-async def get_documents_hybrid_search_retriever(
-    session: AsyncSession = Depends(get_async_session),
-):
-    return DocumentHybridSearchRetriever(session)
 
 
 def has_permission(user_permissions: list[str], required_permission: str) -> bool:
@@ -872,6 +2035,11 @@ def get_default_roles_config() -> list[dict]:
     Get the configuration for default system roles.
     These roles are created automatically when a search space is created.
 
+    Only 3 roles are supported:
+    - Owner: Full access to everything (assigned to search space creator)
+    - Editor: Can create/update content but cannot delete, manage roles, or change settings
+    - Viewer: Read-only access to resources (can add comments)
+
     Returns:
         List of role configurations with name, description, permissions, and flags
     """
@@ -884,15 +2052,8 @@ def get_default_roles_config() -> list[dict]:
             "is_system_role": True,
         },
         {
-            "name": "Admin",
-            "description": "Can manage most resources except deleting the search space",
-            "permissions": DEFAULT_ROLE_PERMISSIONS["Admin"],
-            "is_default": False,
-            "is_system_role": True,
-        },
-        {
             "name": "Editor",
-            "description": "Can create and edit documents, chats, and podcasts",
+            "description": "Can create and update content (no delete, role management, or settings access)",
             "permissions": DEFAULT_ROLE_PERMISSIONS["Editor"],
             "is_default": True,  # Default role for new members via invite
             "is_system_role": True,

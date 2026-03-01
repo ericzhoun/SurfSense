@@ -1,36 +1,45 @@
 "use client";
 
+import { useAtomValue } from "jotai";
 import {
 	AlertCircle,
-	Bot,
-	Check,
-	CheckCircle,
-	ChevronsUpDown,
-	Clock,
 	Edit3,
-	Eye,
-	EyeOff,
-	Loader2,
+	FileText,
+	Info,
+	MessageSquareQuote,
 	Plus,
 	RefreshCw,
-	Settings2,
 	Trash2,
+	Wand2,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useState } from "react";
-import { toast } from "sonner";
+import Image from "next/image";
+import { useCallback, useMemo, useState } from "react";
+import { membersAtom, myAccessAtom } from "@/atoms/members/members-query.atoms";
+import {
+	createNewLLMConfigMutationAtom,
+	deleteNewLLMConfigMutationAtom,
+	updateNewLLMConfigMutationAtom,
+} from "@/atoms/new-llm-config/new-llm-config-mutation.atoms";
+import {
+	globalNewLLMConfigsAtom,
+	newLLMConfigsAtom,
+} from "@/atoms/new-llm-config/new-llm-config-query.atoms";
+import { LLMConfigForm, type LLMConfigFormData } from "@/components/shared/llm-config-form";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import {
-	Command,
-	CommandEmpty,
-	CommandGroup,
-	CommandInput,
-	CommandItem,
-	CommandList,
-} from "@/components/ui/command";
 import {
 	Dialog,
 	DialogContent,
@@ -38,433 +47,449 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/components/ui/select";
-import { LANGUAGES } from "@/contracts/enums/languages";
-import { getModelsByProvider } from "@/contracts/enums/llm-models";
-import { LLM_PROVIDERS } from "@/contracts/enums/llm-providers";
-import {
-	type CreateLLMConfig,
-	type LLMConfig,
-	useGlobalLLMConfigs,
-	useLLMConfigs,
-} from "@/hooks/use-llm-configs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import type { NewLLMConfig } from "@/contracts/types/new-llm-config.types";
+import { getProviderIcon } from "@/lib/provider-icons";
 import { cn } from "@/lib/utils";
-import InferenceParamsEditor from "../inference-params-editor";
 
 interface ModelConfigManagerProps {
 	searchSpaceId: number;
 }
 
+const container = {
+	hidden: { opacity: 0 },
+	show: {
+		opacity: 1,
+		transition: {
+			staggerChildren: 0.05,
+		},
+	},
+};
+
+const item = {
+	hidden: { opacity: 0, y: 20 },
+	show: { opacity: 1, y: 0 },
+};
+
+function getInitials(name: string): string {
+	const parts = name.trim().split(/\s+/);
+	if (parts.length >= 2) {
+		return (parts[0][0] + parts[1][0]).toUpperCase();
+	}
+	return name.slice(0, 2).toUpperCase();
+}
+
 export function ModelConfigManager({ searchSpaceId }: ModelConfigManagerProps) {
+	// Mutations
+	const { mutateAsync: createConfig, isPending: isCreating } = useAtomValue(
+		createNewLLMConfigMutationAtom
+	);
+	const { mutateAsync: updateConfig, isPending: isUpdating } = useAtomValue(
+		updateNewLLMConfigMutationAtom
+	);
+	const { mutateAsync: deleteConfig, isPending: isDeleting } = useAtomValue(
+		deleteNewLLMConfigMutationAtom
+	);
+
+	// Queries
 	const {
-		llmConfigs,
-		loading,
-		error,
-		createLLMConfig,
-		updateLLMConfig,
-		deleteLLMConfig,
-		refreshConfigs,
-	} = useLLMConfigs(searchSpaceId);
-	const { globalConfigs } = useGlobalLLMConfigs();
-	const [isAddingNew, setIsAddingNew] = useState(false);
-	const [editingConfig, setEditingConfig] = useState<LLMConfig | null>(null);
-	const [showApiKey, setShowApiKey] = useState<Record<number, boolean>>({});
-	const [formData, setFormData] = useState<CreateLLMConfig>({
-		name: "",
-		provider: "",
-		custom_provider: "",
-		model_name: "",
-		api_key: "",
-		api_base: "",
-		language: "English",
-		litellm_params: {},
-		search_space_id: searchSpaceId,
-	});
-	const [isSubmitting, setIsSubmitting] = useState(false);
-	const [modelComboboxOpen, setModelComboboxOpen] = useState(false);
+		data: configs,
+		isFetching: isLoading,
+		error: fetchError,
+		refetch: refreshConfigs,
+	} = useAtomValue(newLLMConfigsAtom);
+	const { data: globalConfigs = [] } = useAtomValue(globalNewLLMConfigsAtom);
 
-	// Populate form when editing
-	useEffect(() => {
-		if (editingConfig) {
-			setFormData({
-				name: editingConfig.name,
-				provider: editingConfig.provider,
-				custom_provider: editingConfig.custom_provider || "",
-				model_name: editingConfig.model_name,
-				api_key: editingConfig.api_key,
-				api_base: editingConfig.api_base || "",
-				language: editingConfig.language || "English",
-				litellm_params: editingConfig.litellm_params || {},
-				search_space_id: searchSpaceId,
-			});
+	// Members for user resolution
+	const { data: members } = useAtomValue(membersAtom);
+	const memberMap = useMemo(() => {
+		const map = new Map<string, { name: string; email?: string; avatarUrl?: string }>();
+		if (members) {
+			for (const m of members) {
+				map.set(m.user_id, {
+					name: m.user_display_name || m.user_email || "Unknown",
+					email: m.user_email || undefined,
+					avatarUrl: m.user_avatar_url || undefined,
+				});
+			}
 		}
-	}, [editingConfig, searchSpaceId]);
+		return map;
+	}, [members]);
 
-	const handleInputChange = (field: keyof CreateLLMConfig, value: string) => {
-		setFormData((prev) => ({ ...prev, [field]: value }));
-	};
+	// Permissions
+	const { data: access } = useAtomValue(myAccessAtom);
+	const canCreate = useMemo(() => {
+		if (!access) return false;
+		if (access.is_owner) return true;
+		return access.permissions?.includes("llm_configs:create") ?? false;
+	}, [access]);
+	const canUpdate = useMemo(() => {
+		if (!access) return false;
+		if (access.is_owner) return true;
+		return access.permissions?.includes("llm_configs:update") ?? false;
+	}, [access]);
+	const canDelete = useMemo(() => {
+		if (!access) return false;
+		if (access.is_owner) return true;
+		return access.permissions?.includes("llm_configs:delete") ?? false;
+	}, [access]);
+	const isReadOnly = !canCreate && !canUpdate && !canDelete;
 
-	// Handle provider change with auto-fill API Base URL and reset model / 处理 Provider 变更并自动填充 API Base URL 并重置模型
-	const handleProviderChange = (providerValue: string) => {
-		const provider = LLM_PROVIDERS.find((p) => p.value === providerValue);
-		setFormData((prev) => ({
-			...prev,
-			provider: providerValue,
-			model_name: "", // Reset model when provider changes
-			// Auto-fill API Base URL if provider has a default / 如果提供商有默认值则自动填充
-			api_base: provider?.apiBase || prev.api_base,
-		}));
-	};
+	// Local state
+	const [isDialogOpen, setIsDialogOpen] = useState(false);
+	const [editingConfig, setEditingConfig] = useState<NewLLMConfig | null>(null);
+	const [configToDelete, setConfigToDelete] = useState<NewLLMConfig | null>(null);
 
-	const handleSubmit = async (e: React.FormEvent) => {
-		e.preventDefault();
-		if (!formData.name || !formData.provider || !formData.model_name || !formData.api_key) {
-			toast.error("Please fill in all required fields");
-			return;
-		}
+	const isSubmitting = isCreating || isUpdating;
 
-		setIsSubmitting(true);
+	const handleFormSubmit = useCallback(
+		async (formData: LLMConfigFormData) => {
+			try {
+				if (editingConfig) {
+					const { search_space_id, ...updateData } = formData;
+					await updateConfig({
+						id: editingConfig.id,
+						data: updateData,
+					});
+				} else {
+					await createConfig(formData);
+				}
+				setIsDialogOpen(false);
+				setEditingConfig(null);
+			} catch {
+				// Error is displayed inside the dialog by the form
+			}
+		},
+		[editingConfig, createConfig, updateConfig]
+	);
 
-		let result: LLMConfig | null = null;
-		if (editingConfig) {
-			// Update existing config
-			result = await updateLLMConfig(editingConfig.id, formData);
-		} else {
-			// Create new config
-			result = await createLLMConfig(formData);
-		}
-
-		setIsSubmitting(false);
-
-		if (result) {
-			setFormData({
-				name: "",
-				provider: "",
-				custom_provider: "",
-				model_name: "",
-				api_key: "",
-				api_base: "",
-				language: "English",
-				litellm_params: {},
-				search_space_id: searchSpaceId,
-			});
-			setIsAddingNew(false);
-			setEditingConfig(null);
+	const handleDelete = async () => {
+		if (!configToDelete) return;
+		try {
+			await deleteConfig({ id: configToDelete.id });
+			setConfigToDelete(null);
+		} catch {
+			// Error handled by mutation state
 		}
 	};
 
-	const handleDelete = async (id: number) => {
-		if (
-			confirm("Are you sure you want to delete this configuration? This action cannot be undone.")
-		) {
-			await deleteLLMConfig(id);
-		}
+	const openEditDialog = (config: NewLLMConfig) => {
+		setEditingConfig(config);
+		setIsDialogOpen(true);
 	};
 
-	const toggleApiKeyVisibility = (configId: number) => {
-		setShowApiKey((prev) => ({
-			...prev,
-			[configId]: !prev[configId],
-		}));
+	const openNewDialog = () => {
+		setEditingConfig(null);
+		setIsDialogOpen(true);
 	};
 
-	const selectedProvider = LLM_PROVIDERS.find((p) => p.value === formData.provider);
-	const availableModels = formData.provider ? getModelsByProvider(formData.provider) : [];
-
-	const getProviderInfo = (providerValue: string) => {
-		return LLM_PROVIDERS.find((p) => p.value === providerValue);
-	};
-
-	const maskApiKey = (apiKey: string) => {
-		if (apiKey.length <= 8) return "*".repeat(apiKey.length);
-		return (
-			apiKey.substring(0, 4) + "*".repeat(apiKey.length - 8) + apiKey.substring(apiKey.length - 4)
-		);
+	const closeDialog = () => {
+		setIsDialogOpen(false);
+		setEditingConfig(null);
 	};
 
 	return (
-		<div className="space-y-6">
-			{/* Header */}
-			<div className="flex flex-col space-y-4 sm:flex-row sm:items-center sm:justify-between sm:space-y-0">
-				<div className="space-y-1">
-					<div className="flex items-center space-x-3">
-						<div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500/10">
-							<Settings2 className="h-5 w-5 text-blue-600" />
-						</div>
-						<div>
-							<h2 className="text-2xl font-bold tracking-tight">Model Configurations</h2>
-							<p className="text-muted-foreground">
-								Manage your LLM provider configurations and API settings.
-							</p>
-						</div>
-					</div>
-				</div>
-				<div className="flex items-center space-x-2">
+		<div className="space-y-5 md:space-y-6">
+			{/* Header actions */}
+			<div className="flex items-center justify-between">
+				<Button
+					variant="outline"
+					size="sm"
+					onClick={() => refreshConfigs()}
+					disabled={isLoading}
+					className="flex items-center gap-2 text-xs md:text-sm h-8 md:h-9"
+				>
+					<RefreshCw className={cn("h-3 w-3 md:h-4 md:w-4", isLoading && "animate-spin")} />
+					Refresh
+				</Button>
+				{canCreate && (
 					<Button
-						variant="outline"
+						onClick={openNewDialog}
 						size="sm"
-						onClick={refreshConfigs}
-						disabled={loading}
-						className="flex items-center gap-2"
+						className="flex items-center gap-2 text-xs md:text-sm h-8 md:h-9"
 					>
-						<RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-						Refresh
+						Add Configuration
 					</Button>
-				</div>
+				)}
 			</div>
 
-			{/* Error Alert */}
-			{error && (
-				<Alert variant="destructive">
-					<AlertCircle className="h-4 w-4" />
-					<AlertDescription>{error}</AlertDescription>
-				</Alert>
+			{/* Fetch Error Alert */}
+			<AnimatePresence>
+				{fetchError && (
+					<motion.div
+						key="fetch-error"
+						initial={{ opacity: 0, y: -10 }}
+						animate={{ opacity: 1, y: 0 }}
+						exit={{ opacity: 0, y: -10 }}
+					>
+						<Alert variant="destructive" className="py-3 md:py-4">
+							<AlertCircle className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+							<AlertDescription className="text-xs md:text-sm">
+								{fetchError?.message ?? "Failed to load configurations"}
+							</AlertDescription>
+						</Alert>
+					</motion.div>
+				)}
+			</AnimatePresence>
+
+			{/* Read-only / Limited permissions notice */}
+			{access && !isLoading && isReadOnly && (
+				<motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}>
+					<Alert className="bg-muted/50 py-3 md:py-4">
+						<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+						<AlertDescription className="text-xs md:text-sm">
+							You have <span className="font-medium">read-only</span> access to LLM configurations.
+							Contact a space owner to request additional permissions.
+						</AlertDescription>
+					</Alert>
+				</motion.div>
+			)}
+			{access && !isLoading && !isReadOnly && (!canCreate || !canUpdate || !canDelete) && (
+				<motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}>
+					<Alert className="bg-muted/50 py-3 md:py-4">
+						<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+						<AlertDescription className="text-xs md:text-sm">
+							You can{" "}
+							{[canCreate && "create", canUpdate && "edit", canDelete && "delete"]
+								.filter(Boolean)
+								.join(" and ")}{" "}
+							configurations
+							{!canDelete && ", but cannot delete them"}.
+						</AlertDescription>
+					</Alert>
+				</motion.div>
 			)}
 
-			{/* Global Configs Info Alert */}
-			{!loading && !error && globalConfigs.length > 0 && (
-				<Alert>
-					<CheckCircle className="h-4 w-4" />
-					<AlertDescription>
-						<strong>
-							{globalConfigs.length} global configuration{globalConfigs.length > 1 ? "s" : ""}
-						</strong>{" "}
-						available for use. You can assign them in the LLM Roles tab without adding your own API
-						keys.
-					</AlertDescription>
-				</Alert>
+			{/* Global Configs Info */}
+			{globalConfigs.length > 0 && (
+				<motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}>
+					<Alert className="bg-muted/50 py-3 md:py-4">
+						<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+						<AlertDescription className="text-xs md:text-sm">
+							<span className="font-medium">{globalConfigs.length} global configuration(s)</span>{" "}
+							available from your administrator. These are pre-configured and ready to use.{" "}
+							<span className="text-muted-foreground">
+								Global configs: {globalConfigs.map((g) => g.name).join(", ")}
+							</span>
+						</AlertDescription>
+					</Alert>
+				</motion.div>
 			)}
 
-			{/* Loading State */}
-			{loading && (
-				<Card>
-					<CardContent className="flex items-center justify-center py-12">
-						<div className="flex items-center gap-2 text-muted-foreground">
-							<Loader2 className="w-5 h-5 animate-spin" />
-							<span>Loading configurations...</span>
-						</div>
-					</CardContent>
-				</Card>
-			)}
-
-			{/* Stats Overview */}
-			{!loading && !error && (
-				<div className="grid gap-4 md:grid-cols-3">
-					<Card className="border-l-4 border-l-blue-500">
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight">{llmConfigs.length}</p>
-									<p className="text-sm font-medium text-muted-foreground">Total Configurations</p>
+			{/* Loading Skeleton */}
+			{isLoading && (
+				<div className="grid gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3">
+					{["skeleton-a", "skeleton-b", "skeleton-c"].map((key) => (
+						<Card key={key} className="border-border/60">
+							<CardContent className="p-4 flex flex-col gap-3">
+								{/* Header */}
+								<div className="flex items-start justify-between gap-2">
+									<div className="space-y-1.5 flex-1 min-w-0">
+										<Skeleton className="h-4 w-28 md:w-32" />
+										<Skeleton className="h-3 w-40 md:w-48" />
+									</div>
 								</div>
-								<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-blue-500/10">
-									<Bot className="h-6 w-6 text-blue-600" />
+								{/* Provider + Model */}
+								<div className="flex items-center gap-2">
+									<Skeleton className="h-5 w-16 rounded-full" />
+									<Skeleton className="h-5 w-24 rounded-md" />
 								</div>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card className="border-l-4 border-l-green-500">
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight">
-										{new Set(llmConfigs.map((c) => c.provider)).size}
-									</p>
-									<p className="text-sm font-medium text-muted-foreground">Unique Providers</p>
+								{/* Feature badges */}
+								<div className="flex items-center gap-1.5">
+									<Skeleton className="h-5 w-20 rounded-full" />
+									<Skeleton className="h-5 w-16 rounded-full" />
 								</div>
-								<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-green-500/10">
-									<CheckCircle className="h-6 w-6 text-green-600" />
+								{/* Footer */}
+								<div className="flex items-center gap-2 pt-2 border-t border-border/40">
+									<Skeleton className="h-3 w-20" />
+									<Skeleton className="h-4 w-4 rounded-full" />
+									<Skeleton className="h-3 w-16" />
 								</div>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card className="border-l-4 border-l-emerald-500">
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight text-emerald-600">Active</p>
-									<p className="text-sm font-medium text-muted-foreground">System Status</p>
-								</div>
-								<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-emerald-500/10">
-									<CheckCircle className="h-6 w-6 text-emerald-600" />
-								</div>
-							</div>
-						</CardContent>
-					</Card>
+							</CardContent>
+						</Card>
+					))}
 				</div>
 			)}
 
-			{/* Configuration Management */}
-			{!loading && !error && (
-				<div className="space-y-6">
-					<div className="flex flex-col space-y-4 sm:flex-row sm:items-center sm:justify-between sm:space-y-0">
-						<div>
-							<h3 className="text-xl font-semibold tracking-tight">Your Configurations</h3>
-							<p className="text-sm text-muted-foreground">
-								Manage and configure your LLM providers
-							</p>
-						</div>
-						<Button onClick={() => setIsAddingNew(true)} className="flex items-center gap-2">
-							<Plus className="h-4 w-4" />
-							Add Configuration
-						</Button>
-					</div>
-
-					{llmConfigs.length === 0 ? (
-						<Card className="border-dashed border-2 border-muted-foreground/25">
-							<CardContent className="flex flex-col items-center justify-center py-16 text-center">
-								<div className="rounded-full bg-muted p-4 mb-6">
-									<Bot className="h-10 w-10 text-muted-foreground" />
-								</div>
-								<div className="space-y-2 mb-6">
-									<h3 className="text-xl font-semibold">No Configurations Yet</h3>
-									<p className="text-muted-foreground max-w-sm">
-										Add your own LLM provider configurations.
-									</p>
-								</div>
-								<Button onClick={() => setIsAddingNew(true)} size="lg">
-									<Plus className="h-4 w-4 mr-2" />
-									Add First Configuration
-								</Button>
-							</CardContent>
-						</Card>
+			{/* Configurations List */}
+			{!isLoading && (
+				<div className="space-y-4">
+					{configs?.length === 0 ? (
+						<motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+							<Card className="border-dashed border-2 border-muted-foreground/25">
+								<CardContent className="flex flex-col items-center justify-center py-10 md:py-16 text-center">
+									<div className="rounded-full bg-gradient-to-br from-violet-500/10 to-purple-500/10 p-4 md:p-6 mb-4 md:mb-6">
+										<Wand2 className="h-8 w-8 md:h-12 md:w-12 text-violet-600 dark:text-violet-400" />
+									</div>
+									<div className="space-y-2 mb-4 md:mb-6">
+										<h3 className="text-lg md:text-xl font-semibold">No Configurations Yet</h3>
+										<p className="text-xs md:text-sm text-muted-foreground max-w-sm">
+											{canCreate
+												? "Create your first AI configuration to customize how your agent responds"
+												: "No AI configurations have been added to this space yet. Contact a space owner to add one."}
+										</p>
+									</div>
+									{canCreate && (
+										<Button
+											onClick={openNewDialog}
+											size="lg"
+											className="gap-2 text-xs md:text-sm h-9 md:h-10"
+										>
+											<Plus className="h-3 w-3 md:h-4 md:w-4" />
+											Create First Configuration
+										</Button>
+									)}
+								</CardContent>
+							</Card>
+						</motion.div>
 					) : (
-						<div className="grid gap-4">
-							<AnimatePresence>
-								{llmConfigs.map((config) => {
-									const providerInfo = getProviderInfo(config.provider);
+						<motion.div
+							variants={container}
+							initial="hidden"
+							animate="show"
+							className="grid gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3"
+						>
+							<AnimatePresence mode="popLayout">
+								{configs?.map((config) => {
+									const member = config.user_id ? memberMap.get(config.user_id) : null;
+
 									return (
 										<motion.div
 											key={config.id}
-											initial={{ opacity: 0, y: 10 }}
-											animate={{ opacity: 1, y: 0 }}
-											exit={{ opacity: 0, y: -10 }}
-											transition={{ duration: 0.2 }}
+											variants={item}
+											layout
+											exit={{ opacity: 0, scale: 0.95 }}
 										>
-											<Card className="group border-l-4 border-l-primary/50 hover:border-l-primary hover:shadow-md transition-all duration-200">
-												<CardContent className="p-6">
-													<div className="flex items-start justify-between">
-														<div className="flex-1 space-y-4">
-															{/* Header */}
-															<div className="flex items-start gap-4">
-																<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-primary/10 group-hover:bg-primary/20 transition-colors">
-																	<Bot className="h-6 w-6 text-primary" />
-																</div>
-																<div className="flex-1 space-y-2">
-																	<div className="flex items-center gap-3">
-																		<h4 className="text-lg font-semibold tracking-tight">
-																			{config.name}
-																		</h4>
-																		<Badge variant="secondary" className="text-xs font-medium">
-																			{config.provider}
-																		</Badge>
-																	</div>
-																	<p className="text-sm text-muted-foreground font-mono">
-																		{config.model_name}
-																	</p>
-																	{config.language && (
-																		<div className="flex items-center gap-2">
-																			<Badge variant="outline" className="text-xs">
-																				{config.language}
-																			</Badge>
-																		</div>
-																	)}
-																</div>
-															</div>
-
-															{/* Provider Description */}
-															{providerInfo && (
-																<p className="text-sm text-muted-foreground">
-																	{providerInfo.description}
+											<Card className="group relative overflow-hidden transition-all duration-200 border-border/60 hover:shadow-md h-full">
+												<CardContent className="p-4 flex flex-col gap-3 h-full">
+													{/* Header: Name + Actions */}
+													<div className="flex items-start justify-between gap-2">
+														<div className="min-w-0 flex-1">
+															<h4 className="text-sm font-semibold tracking-tight truncate">
+																{config.name}
+															</h4>
+															{config.description && (
+																<p className="text-[11px] text-muted-foreground/70 truncate mt-0.5">
+																	{config.description}
 																</p>
 															)}
-
-															{/* Configuration Details */}
-															<div className="grid gap-4 sm:grid-cols-2">
-																<div className="space-y-2">
-																	<Label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-																		API Key
-																	</Label>
-																	<div className="flex items-center space-x-2">
-																		<code className="flex-1 rounded-md bg-muted px-3 py-2 text-xs font-mono">
-																			{showApiKey[config.id]
-																				? config.api_key
-																				: maskApiKey(config.api_key)}
-																		</code>
-																		<Button
-																			variant="ghost"
-																			size="sm"
-																			onClick={() => toggleApiKeyVisibility(config.id)}
-																			className="h-8 w-8 p-0"
-																		>
-																			{showApiKey[config.id] ? (
-																				<EyeOff className="h-3 w-3" />
-																			) : (
-																				<Eye className="h-3 w-3" />
-																			)}
-																		</Button>
-																	</div>
-																</div>
-
-																{config.api_base && (
-																	<div className="space-y-2">
-																		<Label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-																			API Base URL
-																		</Label>
-																		<code className="block rounded-md bg-muted px-3 py-2 text-xs font-mono break-all">
-																			{config.api_base}
-																		</code>
-																	</div>
+														</div>
+														{(canUpdate || canDelete) && (
+															<div className="flex items-center gap-0.5 shrink-0 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-150">
+																{canUpdate && (
+																	<TooltipProvider>
+																		<Tooltip>
+																			<TooltipTrigger asChild>
+																				<Button
+																					variant="ghost"
+																					size="icon"
+																					onClick={() => openEditDialog(config)}
+																					className="h-7 w-7 text-muted-foreground hover:text-foreground"
+																				>
+																					<Edit3 className="h-3 w-3" />
+																				</Button>
+																			</TooltipTrigger>
+																			<TooltipContent>Edit</TooltipContent>
+																		</Tooltip>
+																	</TooltipProvider>
+																)}
+																{canDelete && (
+																	<TooltipProvider>
+																		<Tooltip>
+																			<TooltipTrigger asChild>
+																				<Button
+																					variant="ghost"
+																					size="icon"
+																					onClick={() => setConfigToDelete(config)}
+																					className="h-7 w-7 text-muted-foreground hover:text-destructive"
+																				>
+																					<Trash2 className="h-3 w-3" />
+																				</Button>
+																			</TooltipTrigger>
+																			<TooltipContent>Delete</TooltipContent>
+																		</Tooltip>
+																	</TooltipProvider>
 																)}
 															</div>
+														)}
+													</div>
 
-															{/* Metadata */}
-															<div className="flex flex-wrap items-center gap-4 pt-4 border-t border-border/50">
-																{config.created_at && (
-																	<div className="flex items-center gap-2 text-xs text-muted-foreground">
-																		<Clock className="h-3 w-3" />
-																		<span>
-																			Created {new Date(config.created_at).toLocaleDateString()}
-																		</span>
-																	</div>
-																)}
-																<div className="flex items-center gap-2 text-xs">
-																	<div className="h-2 w-2 rounded-full bg-green-500"></div>
-																	<span className="text-green-600 font-medium">Active</span>
-																</div>
-															</div>
-														</div>
+													{/* Provider + Model */}
+													<div className="flex items-center gap-2 flex-wrap">
+														{getProviderIcon(config.provider, { className: "size-3.5 shrink-0" })}
+														<code className="text-[11px] font-mono text-muted-foreground bg-muted/60 px-2 py-0.5 rounded-md truncate max-w-[160px]">
+															{config.model_name}
+														</code>
+													</div>
 
-														{/* Actions */}
-														<div className="flex flex-col gap-2 ml-6">
-															<Button
+													{/* Feature badges */}
+													<div className="flex items-center gap-1.5 flex-wrap">
+														{config.citations_enabled && (
+															<Badge
 																variant="outline"
-																size="sm"
-																onClick={() => setEditingConfig(config)}
-																className="h-8 w-8 p-0"
+																className="text-[10px] px-1.5 py-0.5 border-emerald-500/30 text-emerald-700 dark:text-emerald-300 bg-emerald-500/5"
 															>
-																<Edit3 className="h-4 w-4" />
-															</Button>
-															<Button
-																variant="outline"
-																size="sm"
-																onClick={() => handleDelete(config.id)}
-																className="h-8 w-8 p-0 border-destructive/20 text-destructive hover:bg-destructive hover:text-destructive-foreground"
-															>
-																<Trash2 className="h-4 w-4" />
-															</Button>
-														</div>
+																<MessageSquareQuote className="h-2.5 w-2.5 mr-1" />
+																Citations
+															</Badge>
+														)}
+														{!config.use_default_system_instructions &&
+															config.system_instructions && (
+																<Badge
+																	variant="outline"
+																	className="text-[10px] px-1.5 py-0.5 border-blue-500/30 text-blue-700 dark:text-blue-300 bg-blue-500/5"
+																>
+																	<FileText className="h-2.5 w-2.5 mr-1" />
+																	Custom
+																</Badge>
+															)}
+													</div>
+
+													{/* Footer: Date + Creator */}
+													<div className="flex items-center gap-2 pt-2 border-t border-border/40 mt-auto">
+														<span className="text-[11px] text-muted-foreground/60">
+															{new Date(config.created_at).toLocaleDateString(undefined, {
+																year: "numeric",
+																month: "short",
+																day: "numeric",
+															})}
+														</span>
+														{member && (
+															<>
+																<span className="text-muted-foreground/30">·</span>
+																<TooltipProvider>
+																	<Tooltip>
+																		<TooltipTrigger asChild>
+																			<div className="flex items-center gap-1.5 cursor-default">
+																				{member.avatarUrl ? (
+																					<Image
+																						src={member.avatarUrl}
+																						alt={member.name}
+																						width={18}
+																						height={18}
+																						className="h-4.5 w-4.5 rounded-full object-cover shrink-0"
+																					/>
+																				) : (
+																					<div className="flex h-4.5 w-4.5 items-center justify-center rounded-full bg-gradient-to-br from-primary/20 to-primary/5 shrink-0">
+																						<span className="text-[9px] font-semibold text-primary">
+																							{getInitials(member.name)}
+																						</span>
+																					</div>
+																				)}
+																				<span className="text-[11px] text-muted-foreground/60 truncate max-w-[120px]">
+																					{member.name}
+																				</span>
+																			</div>
+																		</TooltipTrigger>
+																		<TooltipContent side="bottom">
+																			{member.email || member.name}
+																		</TooltipContent>
+																	</Tooltip>
+																</TooltipProvider>
+															</>
+														)}
 													</div>
 												</CardContent>
 											</Card>
@@ -472,337 +497,100 @@ export function ModelConfigManager({ searchSpaceId }: ModelConfigManagerProps) {
 									);
 								})}
 							</AnimatePresence>
-						</div>
+						</motion.div>
 					)}
 				</div>
 			)}
 
 			{/* Add/Edit Configuration Dialog */}
-			<Dialog
-				open={isAddingNew || !!editingConfig}
-				onOpenChange={(open) => {
-					if (!open) {
-						setIsAddingNew(false);
-						setEditingConfig(null);
-						setFormData({
-							name: "",
-							provider: "",
-							custom_provider: "",
-							model_name: "",
-							api_key: "",
-							api_base: "",
-							language: "",
-							litellm_params: {},
-							search_space_id: searchSpaceId,
-						});
-					}
-				}}
-			>
-				<DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+			<Dialog open={isDialogOpen} onOpenChange={(open) => !open && closeDialog()}>
+				<DialogContent
+					className="max-w-2xl max-h-[90vh] overflow-y-auto"
+					onOpenAutoFocus={(e) => e.preventDefault()}
+				>
 					<DialogHeader>
-						<DialogTitle className="flex items-center gap-2">
-							{editingConfig ? <Edit3 className="w-5 h-5" /> : <Plus className="w-5 h-5" />}
-							{editingConfig ? "Edit LLM Configuration" : "Add New LLM Configuration"}
+						<DialogTitle>
+							{editingConfig ? "Edit Configuration" : "Create New Configuration"}
 						</DialogTitle>
 						<DialogDescription>
 							{editingConfig
-								? "Update your language model provider configuration"
-								: "Configure a new language model provider for your AI assistant"}
+								? "Update your AI model and prompt configuration"
+								: "Set up a new AI model with custom prompts and citation settings"}
 						</DialogDescription>
 					</DialogHeader>
 
-					<form onSubmit={handleSubmit} className="space-y-4">
-						<div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-							<div className="space-y-2">
-								<Label htmlFor="name">Configuration Name *</Label>
-								<Input
-									id="name"
-									placeholder="e.g., My OpenAI GPT-4"
-									value={formData.name}
-									onChange={(e) => handleInputChange("name", e.target.value)}
-									required
-								/>
-							</div>
-
-							<div className="space-y-2">
-								<Label htmlFor="provider">Provider *</Label>
-								<Select value={formData.provider} onValueChange={handleProviderChange}>
-									<SelectTrigger>
-										<SelectValue placeholder="Select a provider">
-											{formData.provider && (
-												<span className="font-medium">
-													{LLM_PROVIDERS.find((p) => p.value === formData.provider)?.label}
-												</span>
-											)}
-										</SelectValue>
-									</SelectTrigger>
-									<SelectContent>
-										{LLM_PROVIDERS.map((provider) => (
-											<SelectItem key={provider.value} value={provider.value}>
-												<div className="space-y-1 py-1">
-													<div className="font-medium">{provider.label}</div>
-													<div className="text-xs text-muted-foreground">
-														{provider.description}
-													</div>
-												</div>
-											</SelectItem>
-										))}
-									</SelectContent>
-								</Select>
-							</div>
-						</div>
-
-						{formData.provider === "CUSTOM" && (
-							<div className="space-y-2">
-								<Label htmlFor="custom_provider">Custom Provider Name *</Label>
-								<Input
-									id="custom_provider"
-									placeholder="e.g., my-custom-provider"
-									value={formData.custom_provider}
-									onChange={(e) => handleInputChange("custom_provider", e.target.value)}
-									required
-								/>
-							</div>
-						)}
-
-						<div className="space-y-2">
-							<Label htmlFor="model_name">Model Name *</Label>
-							<Popover open={modelComboboxOpen} onOpenChange={setModelComboboxOpen}>
-								<PopoverTrigger asChild>
-									<Button
-										variant="outline"
-										aria-expanded={modelComboboxOpen}
-										className="w-full justify-between font-normal"
-									>
-										<span className={cn(!formData.model_name && "text-muted-foreground")}>
-											{formData.model_name || "Select or type model name..."}
-										</span>
-										<ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-									</Button>
-								</PopoverTrigger>
-								<PopoverContent className="w-full p-0" align="start" side="bottom">
-									<Command shouldFilter={false}>
-										<CommandInput
-											placeholder={selectedProvider?.example || "Type model name..."}
-											value={formData.model_name}
-											onValueChange={(value) => handleInputChange("model_name", value)}
-										/>
-										<CommandList>
-											<CommandEmpty>
-												<div className="py-2 text-center text-sm text-muted-foreground">
-													{formData.model_name
-														? `Using custom model: "${formData.model_name}"`
-														: "Type your model name above"}
-												</div>
-											</CommandEmpty>
-											{availableModels.length > 0 && (
-												<CommandGroup heading="Suggested Models">
-													{availableModels
-														.filter(
-															(model) =>
-																!formData.model_name ||
-																model.value
-																	.toLowerCase()
-																	.includes(formData.model_name.toLowerCase()) ||
-																model.label
-																	.toLowerCase()
-																	.includes(formData.model_name.toLowerCase())
-														)
-														.map((model) => (
-															<CommandItem
-																key={model.value}
-																value={model.value}
-																onSelect={(currentValue) => {
-																	handleInputChange("model_name", currentValue);
-																	setModelComboboxOpen(false);
-																}}
-																className="flex flex-col items-start py-3"
-															>
-																<div className="flex w-full items-center">
-																	<Check
-																		className={cn(
-																			"mr-2 h-4 w-4 shrink-0",
-																			formData.model_name === model.value
-																				? "opacity-100"
-																				: "opacity-0"
-																		)}
-																	/>
-																	<div className="flex-1">
-																		<div className="font-medium">{model.label}</div>
-																		{model.contextWindow && (
-																			<div className="text-xs text-muted-foreground">
-																				Context: {model.contextWindow}
-																			</div>
-																		)}
-																	</div>
-																</div>
-															</CommandItem>
-														))}
-												</CommandGroup>
-											)}
-										</CommandList>
-									</Command>
-								</PopoverContent>
-							</Popover>
-							<p className="text-xs text-muted-foreground">
-								{availableModels.length > 0
-									? `Type freely or select from ${availableModels.length} model suggestions`
-									: selectedProvider?.example
-										? `Examples: ${selectedProvider.example}`
-										: "Type your model name freely"}
-							</p>
-						</div>
-
-						<div className="space-y-2">
-							<Label htmlFor="language">Language (Optional)</Label>
-							<Select
-								value={formData.language || "English"}
-								onValueChange={(value) => handleInputChange("language", value)}
-							>
-								<SelectTrigger>
-									<SelectValue placeholder="Select language" />
-								</SelectTrigger>
-								<SelectContent>
-									{LANGUAGES.map((language) => (
-										<SelectItem key={language.value} value={language.value}>
-											{language.label}
-										</SelectItem>
-									))}
-								</SelectContent>
-							</Select>
-						</div>
-
-						<div className="space-y-2">
-							<Label htmlFor="api_key">API Key *</Label>
-							<Input
-								id="api_key"
-								type="password"
-								placeholder={
-									formData.provider === "OLLAMA" ? "Any value (e.g., ollama)" : "Your API key"
-								}
-								value={formData.api_key}
-								onChange={(e) => handleInputChange("api_key", e.target.value)}
-								required
-							/>
-							{formData.provider === "OLLAMA" && (
-								<p className="text-xs text-muted-foreground">
-									💡 Ollama doesn't require authentication — enter any value (e.g., "ollama")
-								</p>
-							)}
-						</div>
-
-						<div className="space-y-2">
-							<Label htmlFor="api_base">
-								API Base URL
-								{selectedProvider?.apiBase && (
-									<span className="text-xs font-normal text-muted-foreground ml-2">
-										(Auto-filled for {selectedProvider.label})
-									</span>
-								)}
-							</Label>
-							<Input
-								id="api_base"
-								placeholder={selectedProvider?.apiBase || "e.g., https://api.openai.com/v1"}
-								value={formData.api_base}
-								onChange={(e) => handleInputChange("api_base", e.target.value)}
-							/>
-							{selectedProvider?.apiBase && formData.api_base === selectedProvider.apiBase && (
-								<p className="text-xs text-green-600 flex items-center gap-1">
-									<CheckCircle className="h-3 w-3" />
-									Using recommended API endpoint for {selectedProvider.label}
-								</p>
-							)}
-							{selectedProvider?.apiBase && !formData.api_base && (
-								<p className="text-xs text-amber-600 flex items-center gap-1">
-									<AlertCircle className="h-3 w-3" />
-									⚠️ API Base URL is required for {selectedProvider.label}. Click to auto-fill:
-									<button
-										type="button"
-										className="underline font-medium"
-										onClick={() => handleInputChange("api_base", selectedProvider.apiBase || "")}
-									>
-										{selectedProvider.apiBase}
-									</button>
-								</p>
-							)}
-							{/* Ollama-specific help */}
-							{formData.provider === "OLLAMA" && (
-								<div className="mt-2 p-3 bg-muted/50 rounded-lg border border-muted">
-									<p className="text-xs font-medium mb-2">💡 Ollama API Base URL Examples:</p>
-									<div className="space-y-1.5">
-										<button
-											type="button"
-											className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
-											onClick={() => handleInputChange("api_base", "http://localhost:11434")}
-										>
-											<code className="px-1.5 py-0.5 bg-background rounded border">
-												http://localhost:11434
-											</code>
-											<span>— Standard local installation</span>
-										</button>
-										<button
-											type="button"
-											className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
-											onClick={() =>
-												handleInputChange("api_base", "http://host.docker.internal:11434")
-											}
-										>
-											<code className="px-1.5 py-0.5 bg-background rounded border">
-												http://host.docker.internal:11434
-											</code>
-											<span>— If using SurfSense Docker image</span>
-										</button>
-									</div>
-								</div>
-							)}
-						</div>
-
-						{/* Optional Inference Parameters */}
-						<div className="pt-4">
-							<InferenceParamsEditor
-								params={formData.litellm_params || {}}
-								setParams={(newParams) =>
-									setFormData((prev) => ({ ...prev, litellm_params: newParams }))
-								}
-							/>
-						</div>
-
-						<div className="flex gap-2 pt-4">
-							<Button type="submit" disabled={isSubmitting}>
-								{isSubmitting
-									? editingConfig
-										? "Updating..."
-										: "Adding..."
-									: editingConfig
-										? "Update Configuration"
-										: "Add Configuration"}
-							</Button>
-							<Button
-								type="button"
-								variant="outline"
-								onClick={() => {
-									setIsAddingNew(false);
-									setEditingConfig(null);
-									setFormData({
-										name: "",
-										provider: "",
-										custom_provider: "",
-										model_name: "",
-										api_key: "",
-										api_base: "",
-										language: "",
-										litellm_params: {},
-										search_space_id: searchSpaceId,
-									});
-								}}
-								disabled={isSubmitting}
-							>
-								Cancel
-							</Button>
-						</div>
-					</form>
+					<LLMConfigForm
+						key={editingConfig ? `edit-${editingConfig.id}` : "create"}
+						searchSpaceId={searchSpaceId}
+						initialData={
+							editingConfig
+								? {
+										name: editingConfig.name,
+										description: editingConfig.description || "",
+										provider: editingConfig.provider,
+										custom_provider: editingConfig.custom_provider || "",
+										model_name: editingConfig.model_name,
+										api_key: editingConfig.api_key,
+										api_base: editingConfig.api_base || "",
+										litellm_params: editingConfig.litellm_params || {},
+										system_instructions: editingConfig.system_instructions || "",
+										use_default_system_instructions: editingConfig.use_default_system_instructions,
+										citations_enabled: editingConfig.citations_enabled,
+									}
+								: {
+										citations_enabled: true,
+										use_default_system_instructions: true,
+									}
+						}
+						onSubmit={handleFormSubmit}
+						onCancel={closeDialog}
+						isSubmitting={isSubmitting}
+						mode={editingConfig ? "edit" : "create"}
+						showAdvanced={true}
+						compact={true}
+					/>
 				</DialogContent>
 			</Dialog>
+
+			{/* Delete Confirmation Dialog */}
+			<AlertDialog
+				open={!!configToDelete}
+				onOpenChange={(open) => !open && setConfigToDelete(null)}
+			>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle className="flex items-center gap-2">
+							<Trash2 className="h-5 w-5 text-destructive" />
+							Delete Configuration
+						</AlertDialogTitle>
+						<AlertDialogDescription>
+							Are you sure you want to delete{" "}
+							<span className="font-semibold text-foreground">{configToDelete?.name}</span>? This
+							action cannot be undone.
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+						<AlertDialogAction
+							onClick={handleDelete}
+							disabled={isDeleting}
+							className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+						>
+							{isDeleting ? (
+								<>
+									<Spinner size="sm" className="mr-2" />
+									Deleting
+								</>
+							) : (
+								<>
+									<Trash2 className="mr-2 h-4 w-4" />
+									Delete
+								</>
+							)}
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
 		</div>
 	);
 }

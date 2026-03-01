@@ -4,14 +4,30 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+
+@worker_process_init.connect
+def init_worker(**kwargs):
+    """Initialize the LLM Router and Image Gen Router when a Celery worker process starts.
+
+    This ensures the Auto mode (LiteLLM Router) is available for background tasks
+    like document summarization and image generation.
+    """
+    from app.config import initialize_image_gen_router, initialize_llm_router
+
+    initialize_llm_router()
+    initialize_image_gen_router()
+
+
 # Get Celery configuration from environment
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+CELERY_TASK_DEFAULT_QUEUE = os.getenv("CELERY_TASK_DEFAULT_QUEUE", "surfsense")
 
 # Get schedule checker interval from environment
 # Format: "<number><unit>" where unit is 'm' (minutes) or 'h' (hours)
@@ -63,10 +79,15 @@ celery_app = Celery(
         "app.tasks.celery_tasks.podcast_tasks",
         "app.tasks.celery_tasks.connector_tasks",
         "app.tasks.celery_tasks.schedule_checker_task",
-        "app.tasks.celery_tasks.blocknote_migration_tasks",
         "app.tasks.celery_tasks.document_reindex_tasks",
+        "app.tasks.celery_tasks.stale_notification_cleanup_task",
     ],
 )
+
+# ── Queue names ──────────────────────────────────────────────
+# Default queue  : fast, user-facing tasks (file upload, podcast, reindex, …)
+# Connectors queue: slow, long-running indexing tasks (Notion, Gmail, web crawl, …)
+CONNECTORS_QUEUE = f"{CELERY_TASK_DEFAULT_QUEUE}.connectors"
 
 # Celery configuration
 celery_app.conf.update(
@@ -76,6 +97,9 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    task_default_queue=CELERY_TASK_DEFAULT_QUEUE,
+    task_default_exchange=CELERY_TASK_DEFAULT_QUEUE,
+    task_default_routing_key=CELERY_TASK_DEFAULT_QUEUE,
     # Task execution settings
     task_track_started=True,
     task_time_limit=28800,  # 8 hour hard limit
@@ -93,6 +117,33 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     # Beat scheduler settings
     beat_max_loop_interval=60,  # Check every minute
+    # ── Task routing ─────────────────────────────────────────
+    # Route slow connector/indexing tasks to a dedicated queue so they
+    # never block fast user-facing tasks (file uploads, podcasts, etc.)
+    task_routes={
+        # Connector indexing tasks → connectors queue
+        "index_slack_messages": {"queue": CONNECTORS_QUEUE},
+        "index_notion_pages": {"queue": CONNECTORS_QUEUE},
+        "index_github_repos": {"queue": CONNECTORS_QUEUE},
+        "index_linear_issues": {"queue": CONNECTORS_QUEUE},
+        "index_jira_issues": {"queue": CONNECTORS_QUEUE},
+        "index_confluence_pages": {"queue": CONNECTORS_QUEUE},
+        "index_clickup_tasks": {"queue": CONNECTORS_QUEUE},
+        "index_google_calendar_events": {"queue": CONNECTORS_QUEUE},
+        "index_airtable_records": {"queue": CONNECTORS_QUEUE},
+        "index_google_gmail_messages": {"queue": CONNECTORS_QUEUE},
+        "index_google_drive_files": {"queue": CONNECTORS_QUEUE},
+        "index_discord_messages": {"queue": CONNECTORS_QUEUE},
+        "index_teams_messages": {"queue": CONNECTORS_QUEUE},
+        "index_luma_events": {"queue": CONNECTORS_QUEUE},
+        "index_elasticsearch_documents": {"queue": CONNECTORS_QUEUE},
+        "index_crawled_urls": {"queue": CONNECTORS_QUEUE},
+        "index_bookstack_pages": {"queue": CONNECTORS_QUEUE},
+        "index_obsidian_vault": {"queue": CONNECTORS_QUEUE},
+        "index_composio_connector": {"queue": CONNECTORS_QUEUE},
+        # Everything else (document processing, podcasts, reindexing,
+        # schedule checker, cleanup) stays on the default fast queue.
+    },
 )
 
 # Configure Celery Beat schedule
@@ -105,6 +156,16 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(**schedule_params),
         "options": {
             "expires": 30,  # Task expires after 30 seconds if not picked up
+        },
+    },
+    # Cleanup stale connector indexing notifications every 5 minutes
+    # This detects tasks that crashed or timed out without proper cleanup
+    # and marks their notifications as failed so users don't see perpetual "syncing"
+    "cleanup-stale-indexing-notifications": {
+        "task": "cleanup_stale_indexing_notifications",
+        "schedule": crontab(minute="*/5"),  # Every 5 minutes
+        "options": {
+            "expires": 60,  # Task expires after 60 seconds if not picked up
         },
     },
 }

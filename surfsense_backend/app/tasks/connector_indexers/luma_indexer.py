@@ -1,19 +1,25 @@
 """
 Luma connector indexer.
+
+Implements 2-phase document status updates for real-time UI feedback:
+- Phase 1: Collect all events and create pending documents (visible in UI immediately)
+- Phase 2: Process each event: pending → processing → ready/failed
 """
 
+import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import config
 from app.connectors.luma_connector import LumaConnector
-from app.db import Document, DocumentType, SearchSourceConnectorType
+from app.db import Document, DocumentStatus, DocumentType, SearchSourceConnectorType
 from app.services.llm_service import get_user_long_context_llm
 from app.services.task_logging_service import TaskLoggingService
 from app.utils.document_converters import (
     create_document_chunks,
+    embed_text,
     generate_content_hash,
     generate_document_summary,
     generate_unique_identifier_hash,
@@ -21,10 +27,19 @@ from app.utils.document_converters import (
 
 from .base import (
     check_document_by_unique_identifier,
+    check_duplicate_document_by_hash,
     get_connector_by_id,
+    get_current_timestamp,
     logger,
+    safe_set_chunks,
     update_connector_last_indexed,
 )
+
+# Type hint for heartbeat callback
+HeartbeatCallbackType = Callable[[int], Awaitable[None]]
+
+# Heartbeat interval in seconds
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 async def index_luma_events(
@@ -35,6 +50,7 @@ async def index_luma_events(
     start_date: str | None = None,
     end_date: str | None = None,
     update_last_indexed: bool = True,
+    on_heartbeat_callback: HeartbeatCallbackType | None = None,
 ) -> tuple[int, str | None]:
     """
     Index Luma events.
@@ -44,9 +60,11 @@ async def index_luma_events(
         connector_id: ID of the Luma connector
         search_space_id: ID of the search space to store documents in
         user_id: User ID
-        start_date: Start date for indexing (YYYY-MM-DD format)
-        end_date: End date for indexing (YYYY-MM-DD format)
+        start_date: Start date for indexing (YYYY-MM-DD format). Can be in the past or future.
+        end_date: End date for indexing (YYYY-MM-DD format). Can be in the future to index upcoming events.
+                  Defaults to today if not provided.
         update_last_indexed: Whether to update the last_indexed_at timestamp (default: True)
+        on_heartbeat_callback: Optional callback to update notification during long-running indexing.
 
     Returns:
         Tuple containing (number of documents indexed, error message or None)
@@ -114,9 +132,18 @@ async def index_luma_events(
 
         luma_client = LumaConnector(api_key=api_key)
 
+        # Handle 'undefined' string from frontend (treat as None)
+        # This prevents "time data 'undefined' does not match format" errors
+        if start_date == "undefined" or start_date == "":
+            start_date = None
+        if end_date == "undefined" or end_date == "":
+            end_date = None
+
         # Calculate date range
+        # For calendar connectors, allow future dates to index upcoming events
         if start_date is None or end_date is None:
             # Fall back to calculating dates based on last_indexed_at
+            # Default to today (users can manually select future dates if needed)
             calculated_end_date = datetime.now()
 
             # Use last_indexed_at as start date if available, otherwise use 30 days ago
@@ -128,19 +155,13 @@ async def index_luma_events(
                     else connector.last_indexed_at
                 )
 
-                # Check if last_indexed_at is in the future or after end_date
-                if last_indexed_naive > calculated_end_date:
-                    logger.warning(
-                        f"Last indexed date ({last_indexed_naive.strftime('%Y-%m-%d')}) is in the future. Using 30 days ago instead."
-                    )
-                    calculated_start_date = calculated_end_date - timedelta(days=30)
-                else:
-                    calculated_start_date = last_indexed_naive
-                    logger.info(
-                        f"Using last_indexed_at ({calculated_start_date.strftime('%Y-%m-%d')}) as start date"
-                    )
+                # Allow future dates - use last_indexed_at as start date
+                calculated_start_date = last_indexed_naive
+                logger.info(
+                    f"Using last_indexed_at ({calculated_start_date.strftime('%Y-%m-%d')}) as start date"
+                )
             else:
-                calculated_start_date = calculated_end_date - timedelta(days=30)
+                calculated_start_date = datetime.now() - timedelta(days=30)
                 logger.info(
                     f"No last_indexed_at found, using {calculated_start_date.strftime('%Y-%m-%d')} (30 days ago) as start date"
                 )
@@ -153,7 +174,7 @@ async def index_luma_events(
                 end_date if end_date else calculated_end_date.strftime("%Y-%m-%d")
             )
         else:
-            # Use provided dates
+            # Use provided dates (including future dates)
             start_date_str = start_date
             end_date_str = end_date
 
@@ -174,10 +195,9 @@ async def index_luma_events(
             )
 
             if error:
-                logger.error(f"Failed to get Luma events: {error}")
-
                 # Don't treat "No events found" as an error that should stop indexing
                 if "No events found" in error or "no events" in error.lower():
+                    logger.info(f"No Luma events found: {error}")
                     logger.info(
                         "No events found is not a critical error, continuing with update"
                     )
@@ -197,6 +217,7 @@ async def index_luma_events(
                     )
                     return 0, None
                 else:
+                    logger.error(f"Failed to get Luma events: {error}")
                     await task_logger.log_task_failure(
                         log_entry,
                         f"Failed to get Luma events: {error}",
@@ -211,9 +232,20 @@ async def index_luma_events(
             logger.error(f"Error fetching Luma events: {e!s}", exc_info=True)
             return 0, f"Error fetching Luma events: {e!s}"
 
+        # =======================================================================
+        # PHASE 1: Analyze all events, create pending documents
+        # This makes ALL documents visible in the UI immediately with pending status
+        # =======================================================================
         documents_indexed = 0
         documents_skipped = 0
+        documents_failed = 0
         skipped_events = []
+
+        # Heartbeat tracking - update notification periodically to prevent appearing stuck
+        last_heartbeat_time = time.time()
+
+        events_to_process = []  # List of dicts with document and event data
+        new_documents_created = False
 
         for event in events:
             try:
@@ -272,147 +304,59 @@ async def index_luma_events(
                 if existing_document:
                     # Document exists - check if content has changed
                     if existing_document.content_hash == content_hash:
+                        # Ensure status is ready (might have been stuck in processing/pending)
+                        if not DocumentStatus.is_state(
+                            existing_document.status, DocumentStatus.READY
+                        ):
+                            existing_document.status = DocumentStatus.ready()
                         logger.info(
                             f"Document for Luma event {event_name} unchanged. Skipping."
                         )
                         documents_skipped += 1
                         continue
-                    else:
-                        # Content has changed - update the existing document
-                        logger.info(
-                            f"Content changed for Luma event {event_name}. Updating document."
-                        )
 
-                        # Generate summary with metadata
-                        user_llm = await get_user_long_context_llm(
-                            session, user_id, search_space_id
-                        )
-
-                        if user_llm:
-                            document_metadata = {
-                                "event_id": event_id,
-                                "event_name": event_name,
-                                "event_url": event_url,
-                                "start_at": start_at,
-                                "end_at": end_at,
-                                "timezone": timezone,
-                                "location": location or "No location",
-                                "city": city,
-                                "hosts": host_names,
-                                "document_type": "Luma Event",
-                                "connector_type": "Luma",
-                            }
-                            (
-                                summary_content,
-                                summary_embedding,
-                            ) = await generate_document_summary(
-                                event_markdown, user_llm, document_metadata
-                            )
-                        else:
-                            summary_content = f"Luma Event: {event_name}\n\n"
-                            if event_url:
-                                summary_content += f"URL: {event_url}\n"
-                            summary_content += f"Start: {start_at}\n"
-                            summary_content += f"End: {end_at}\n"
-                            if timezone:
-                                summary_content += f"Timezone: {timezone}\n"
-                            if location:
-                                summary_content += f"Location: {location}\n"
-                            if city:
-                                summary_content += f"City: {city}\n"
-                            if host_names:
-                                summary_content += f"Hosts: {host_names}\n"
-                            if description:
-                                desc_preview = description[:1000]
-                                if len(description) > 1000:
-                                    desc_preview += "..."
-                                summary_content += f"Description: {desc_preview}\n"
-                            summary_embedding = config.embedding_model_instance.embed(
-                                summary_content
-                            )
-
-                        # Process chunks
-                        chunks = await create_document_chunks(event_markdown)
-
-                        # Update existing document
-                        existing_document.title = f"Luma Event - {event_name}"
-                        existing_document.content = summary_content
-                        existing_document.content_hash = content_hash
-                        existing_document.embedding = summary_embedding
-                        existing_document.document_metadata = {
+                    # Queue existing document for update (will be set to processing in Phase 2)
+                    events_to_process.append(
+                        {
+                            "document": existing_document,
+                            "is_new": False,
                             "event_id": event_id,
                             "event_name": event_name,
                             "event_url": event_url,
+                            "event_markdown": event_markdown,
+                            "content_hash": content_hash,
                             "start_at": start_at,
                             "end_at": end_at,
                             "timezone": timezone,
                             "location": location,
                             "city": city,
-                            "hosts": host_names,
-                            "indexed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "host_names": host_names,
+                            "description": description,
+                            "cover_url": cover_url,
                         }
-                        existing_document.chunks = chunks
-
-                        documents_indexed += 1
-                        logger.info(f"Successfully updated Luma event {event_name}")
-                        continue
-
-                # Document doesn't exist - create new one
-                # Generate summary with metadata
-                user_llm = await get_user_long_context_llm(
-                    session, user_id, search_space_id
-                )
-
-                if user_llm:
-                    document_metadata = {
-                        "event_id": event_id,
-                        "event_name": event_name,
-                        "event_url": event_url,
-                        "start_at": start_at,
-                        "end_at": end_at,
-                        "timezone": timezone,
-                        "location": location or "No location",
-                        "city": city,
-                        "hosts": host_names,
-                        "document_type": "Luma Event",
-                        "connector_type": "Luma",
-                    }
-                    (
-                        summary_content,
-                        summary_embedding,
-                    ) = await generate_document_summary(
-                        event_markdown, user_llm, document_metadata
                     )
-                else:
-                    # Fallback to simple summary if no LLM configured
-                    summary_content = f"Luma Event: {event_name}\n\n"
-                    if event_url:
-                        summary_content += f"URL: {event_url}\n"
-                    summary_content += f"Start: {start_at}\n"
-                    summary_content += f"End: {end_at}\n"
-                    if timezone:
-                        summary_content += f"Timezone: {timezone}\n"
-                    if location:
-                        summary_content += f"Location: {location}\n"
-                    if city:
-                        summary_content += f"City: {city}\n"
-                    if host_names:
-                        summary_content += f"Hosts: {host_names}\n"
-                    if description:
-                        desc_preview = description[:1000]
-                        if len(description) > 1000:
-                            desc_preview += "..."
-                        summary_content += f"Description: {desc_preview}\n"
+                    continue
 
-                    summary_embedding = config.embedding_model_instance.embed(
-                        summary_content
+                # Document doesn't exist by unique_identifier_hash
+                # Check if a document with the same content_hash exists (from another connector)
+                with session.no_autoflush:
+                    duplicate_by_content = await check_duplicate_document_by_hash(
+                        session, content_hash
                     )
 
-                chunks = await create_document_chunks(event_markdown)
+                if duplicate_by_content:
+                    logger.info(
+                        f"Luma event {event_name} already indexed by another connector "
+                        f"(existing document ID: {duplicate_by_content.id}, "
+                        f"type: {duplicate_by_content.document_type}). Skipping."
+                    )
+                    documents_skipped += 1
+                    continue
 
+                # Create new document with PENDING status (visible in UI immediately)
                 document = Document(
                     search_space_id=search_space_id,
-                    title=f"Luma Event - {event_name}",
+                    title=event_name,
                     document_type=DocumentType.LUMA_CONNECTOR,
                     document_metadata={
                         "event_id": event_id,
@@ -425,20 +369,132 @@ async def index_luma_events(
                         "city": city,
                         "hosts": host_names,
                         "cover_url": cover_url,
-                        "indexed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "connector_id": connector_id,
                     },
-                    content=summary_content,
-                    content_hash=content_hash,
+                    content="Pending...",  # Placeholder until processed
+                    content_hash=unique_identifier_hash,  # Temporary unique value - updated when ready
                     unique_identifier_hash=unique_identifier_hash,
-                    embedding=summary_embedding,
-                    chunks=chunks,
+                    embedding=None,
+                    chunks=[],  # Empty at creation - safe for async
+                    status=DocumentStatus.pending(),  # Pending until processing starts
+                    updated_at=get_current_timestamp(),
+                    created_by_id=user_id,
+                    connector_id=connector_id,
+                )
+                session.add(document)
+                new_documents_created = True
+
+                events_to_process.append(
+                    {
+                        "document": document,
+                        "is_new": True,
+                        "event_id": event_id,
+                        "event_name": event_name,
+                        "event_url": event_url,
+                        "event_markdown": event_markdown,
+                        "content_hash": content_hash,
+                        "start_at": start_at,
+                        "end_at": end_at,
+                        "timezone": timezone,
+                        "location": location,
+                        "city": city,
+                        "host_names": host_names,
+                        "description": description,
+                        "cover_url": cover_url,
+                    }
                 )
 
-                session.add(document)
-                documents_indexed += 1
-                logger.info(f"Successfully indexed new event {event_name}")
+            except Exception as e:
+                logger.error(f"Error in Phase 1 for event: {e!s}", exc_info=True)
+                documents_failed += 1
+                continue
 
-                # Batch commit every 10 documents
+        # Commit all pending documents - they all appear in UI now
+        if new_documents_created:
+            logger.info(
+                f"Phase 1: Committing {len([e for e in events_to_process if e['is_new']])} pending documents"
+            )
+            await session.commit()
+
+        # =======================================================================
+        # PHASE 2: Process each document one by one
+        # Each document transitions: pending → processing → ready/failed
+        # =======================================================================
+        logger.info(f"Phase 2: Processing {len(events_to_process)} documents")
+
+        for item in events_to_process:
+            # Send heartbeat periodically
+            if on_heartbeat_callback:
+                current_time = time.time()
+                if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL_SECONDS:
+                    await on_heartbeat_callback(documents_indexed)
+                    last_heartbeat_time = current_time
+
+            document = item["document"]
+            try:
+                # Set to PROCESSING and commit - shows "processing" in UI for THIS document only
+                document.status = DocumentStatus.processing()
+                await session.commit()
+
+                # Heavy processing (LLM, embeddings, chunks)
+                user_llm = await get_user_long_context_llm(
+                    session, user_id, search_space_id
+                )
+
+                if user_llm and connector.enable_summary:
+                    document_metadata_for_summary = {
+                        "event_id": item["event_id"],
+                        "event_name": item["event_name"],
+                        "event_url": item["event_url"],
+                        "start_at": item["start_at"],
+                        "end_at": item["end_at"],
+                        "timezone": item["timezone"],
+                        "location": item["location"] or "No location",
+                        "city": item["city"],
+                        "hosts": item["host_names"],
+                        "document_type": "Luma Event",
+                        "connector_type": "Luma",
+                    }
+                    (
+                        summary_content,
+                        summary_embedding,
+                    ) = await generate_document_summary(
+                        item["event_markdown"], user_llm, document_metadata_for_summary
+                    )
+                else:
+                    summary_content = (
+                        f"Luma Event: {item['event_name']}\n\n{item['event_markdown']}"
+                    )
+                    summary_embedding = embed_text(summary_content)
+
+                chunks = await create_document_chunks(item["event_markdown"])
+
+                # Update document to READY with actual content
+                document.title = item["event_name"]
+                document.content = summary_content
+                document.content_hash = item["content_hash"]
+                document.embedding = summary_embedding
+                document.document_metadata = {
+                    "event_id": item["event_id"],
+                    "event_name": item["event_name"],
+                    "event_url": item["event_url"],
+                    "start_at": item["start_at"],
+                    "end_at": item["end_at"],
+                    "timezone": item["timezone"],
+                    "location": item["location"],
+                    "city": item["city"],
+                    "hosts": item["host_names"],
+                    "cover_url": item["cover_url"],
+                    "indexed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "connector_id": connector_id,
+                }
+                safe_set_chunks(document, chunks)
+                document.updated_at = get_current_timestamp()
+                document.status = DocumentStatus.ready()
+
+                documents_indexed += 1
+
+                # Batch commit every 10 documents (for ready status updates)
                 if documents_indexed % 10 == 0:
                     logger.info(
                         f"Committing batch: {documents_indexed} Luma events processed so far"
@@ -447,38 +503,71 @@ async def index_luma_events(
 
             except Exception as e:
                 logger.error(
-                    f"Error processing event {event.get('name', 'Unknown')}: {e!s}",
+                    f"Error processing event {item.get('event_name', 'Unknown')}: {e!s}",
                     exc_info=True,
                 )
+                # Mark document as failed with reason (visible in UI)
+                try:
+                    document.status = DocumentStatus.failed(str(e))
+                    document.updated_at = get_current_timestamp()
+                except Exception as status_error:
+                    logger.error(
+                        f"Failed to update document status to failed: {status_error}"
+                    )
                 skipped_events.append(
-                    f"{event.get('name', 'Unknown')} (processing error)"
+                    f"{item.get('event_name', 'Unknown')} (processing error)"
                 )
-                documents_skipped += 1
+                documents_failed += 1
                 continue
 
-        total_processed = documents_indexed
-        if total_processed > 0:
-            await update_connector_last_indexed(session, connector, update_last_indexed)
+        # CRITICAL: Always update timestamp (even if 0 documents indexed) so Electric SQL syncs
+        # This ensures the UI shows "Last indexed" instead of "Never indexed"
+        await update_connector_last_indexed(session, connector, update_last_indexed)
 
         # Final commit for any remaining documents not yet committed in batches
         logger.info(f"Final commit: Total {documents_indexed} Luma events processed")
-        await session.commit()
+        try:
+            await session.commit()
+            logger.info("Successfully committed all Luma document changes to database")
+        except Exception as e:
+            # Handle any remaining integrity errors gracefully (race conditions, etc.)
+            if (
+                "duplicate key value violates unique constraint" in str(e).lower()
+                or "uniqueviolationerror" in str(e).lower()
+            ):
+                logger.warning(
+                    f"Duplicate content_hash detected during final commit. "
+                    f"This may occur if the same event was indexed by multiple connectors. "
+                    f"Rolling back and continuing. Error: {e!s}"
+                )
+                await session.rollback()
+                # Don't fail the entire task - some documents may have been successfully indexed
+            else:
+                raise
+
+        # Build warning message if there were issues
+        warning_parts = []
+        if documents_failed > 0:
+            warning_parts.append(f"{documents_failed} failed")
+        warning_message = ", ".join(warning_parts) if warning_parts else None
 
         await task_logger.log_task_success(
             log_entry,
             f"Successfully completed Luma indexing for connector {connector_id}",
             {
-                "events_processed": total_processed,
+                "events_processed": documents_indexed,
                 "documents_indexed": documents_indexed,
                 "documents_skipped": documents_skipped,
+                "documents_failed": documents_failed,
                 "skipped_events_count": len(skipped_events),
             },
         )
 
         logger.info(
-            f"Luma indexing completed: {documents_indexed} new events, {documents_skipped} skipped"
+            f"Luma indexing completed: {documents_indexed} ready, "
+            f"{documents_skipped} skipped, {documents_failed} failed"
         )
-        return total_processed, None
+        return documents_indexed, warning_message
 
     except SQLAlchemyError as db_error:
         await session.rollback()

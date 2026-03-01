@@ -1,11 +1,11 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
+import { useAtomValue } from "jotai";
 import {
 	AlertCircle,
 	ArrowRight,
 	CheckCircle2,
-	Clock,
-	Loader2,
 	LogIn,
 	Shield,
 	Sparkles,
@@ -16,7 +16,9 @@ import { motion } from "motion/react";
 import Image from "next/image";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { use, useEffect, useState } from "react";
+import { use, useCallback, useEffect, useState } from "react";
+import { toast } from "sonner";
+import { acceptInviteMutationAtom } from "@/atoms/invites/invites-mutation.atoms";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -26,22 +28,54 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
-import { useInviteInfo } from "@/hooks/use-rbac";
+import { Spinner } from "@/components/ui/spinner";
+import type { AcceptInviteResponse } from "@/contracts/types/invites.types";
+import { invitesApiService } from "@/lib/apis/invites-api.service";
 import { getBearerToken } from "@/lib/auth-utils";
+import {
+	trackSearchSpaceInviteAccepted,
+	trackSearchSpaceInviteDeclined,
+	trackSearchSpaceUserAdded,
+} from "@/lib/posthog/events";
+import { cacheKeys } from "@/lib/query-client/cache-keys";
 
 export default function InviteAcceptPage() {
 	const params = useParams();
 	const router = useRouter();
 	const inviteCode = params.invite_code as string;
 
-	const { inviteInfo, loading, acceptInvite } = useInviteInfo(inviteCode);
+	const { data: inviteInfo = null, isLoading: loading } = useQuery({
+		queryKey: cacheKeys.invites.info(inviteCode),
+		enabled: !!inviteCode,
+		staleTime: 5 * 60 * 1000,
+		queryFn: async () => {
+			if (!inviteCode) return null;
+			return invitesApiService.getInviteInfo({
+				invite_code: inviteCode,
+			});
+		},
+	});
+
+	const { mutateAsync: acceptInviteMutation } = useAtomValue(acceptInviteMutationAtom);
+
+	const acceptInvite = useCallback(async () => {
+		if (!inviteCode) {
+			toast.error("No invite code provided");
+			return null;
+		}
+
+		try {
+			const result = await acceptInviteMutation({ invite_code: inviteCode });
+			return result;
+		} catch (err: any) {
+			toast.error(err.message || "Failed to accept invite");
+			throw err;
+		}
+	}, [inviteCode, acceptInviteMutation]);
+
 	const [accepting, setAccepting] = useState(false);
 	const [accepted, setAccepted] = useState(false);
-	const [acceptedData, setAcceptedData] = useState<{
-		search_space_id: number;
-		search_space_name: string;
-		role_name: string;
-	} | null>(null);
+	const [acceptedData, setAcceptedData] = useState<AcceptInviteResponse | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
 
@@ -61,12 +95,30 @@ export default function InviteAcceptPage() {
 			if (result) {
 				setAccepted(true);
 				setAcceptedData(result);
+
+				// Track invite accepted and user added events
+				trackSearchSpaceInviteAccepted(
+					result.search_space_id,
+					result.search_space_name,
+					result.role_name
+				);
+				trackSearchSpaceUserAdded(
+					result.search_space_id,
+					result.search_space_name,
+					result.role_name
+				);
 			}
 		} catch (err: any) {
 			setError(err.message || "Failed to accept invite");
 		} finally {
 			setAccepting(false);
 		}
+	};
+
+	const handleDecline = () => {
+		// Track invite declined event
+		trackSearchSpaceInviteDeclined(inviteInfo?.search_space_name);
+		router.push("/dashboard");
 	};
 
 	const handleLoginRedirect = () => {
@@ -111,7 +163,7 @@ export default function InviteAcceptPage() {
 								animate={{ rotate: 360 }}
 								transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
 							>
-								<Loader2 className="h-12 w-12 text-primary" />
+								<Spinner size="xl" className="text-primary" />
 							</motion.div>
 							<p className="mt-4 text-muted-foreground">Loading invite details...</p>
 						</CardContent>
@@ -294,17 +346,13 @@ export default function InviteAcceptPage() {
 								)}
 							</CardContent>
 							<CardFooter className="flex gap-2">
-								<Button
-									variant="outline"
-									className="flex-1"
-									onClick={() => router.push("/dashboard")}
-								>
+								<Button variant="outline" className="flex-1" onClick={handleDecline}>
 									Cancel
 								</Button>
 								<Button className="flex-1 gap-2" onClick={handleAccept} disabled={accepting}>
 									{accepting ? (
 										<>
-											<Loader2 className="h-4 w-4 animate-spin" />
+											<Spinner size="sm" />
 											Accepting...
 										</>
 									) : (
@@ -330,7 +378,7 @@ export default function InviteAcceptPage() {
 						href="/"
 						className="inline-flex items-center gap-2 text-muted-foreground hover:text-foreground transition-colors"
 					>
-						<Image src="/icon-128.png" alt="SurfSense" width={24} height={24} className="rounded" />
+						<Image src="/icon-128.svg" alt="SurfSense" width={24} height={24} className="rounded" />
 						<span className="text-sm font-medium">SurfSense</span>
 					</Link>
 				</motion.div>

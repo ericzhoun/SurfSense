@@ -1,28 +1,42 @@
 """Celery tasks for connector indexing."""
 
 import logging
-
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+import traceback
 
 from app.celery_app import celery_app
-from app.config import config
+from app.tasks.celery_tasks import get_celery_session_maker
 
 logger = logging.getLogger(__name__)
 
 
-def get_celery_session_maker():
+def _handle_greenlet_error(e: Exception, task_name: str, connector_id: int) -> None:
     """
-    Create a new async session maker for Celery tasks.
-    This is necessary because Celery tasks run in a new event loop,
-    and the default session maker is bound to the main app's event loop.
+    Handle greenlet_spawn errors with detailed logging for debugging.
+
+    The 'greenlet_spawn has not been called' error occurs when:
+    1. SQLAlchemy lazy-loads a relationship outside of an async context
+    2. A sync operation is called from an async context (or vice versa)
+    3. Session objects are accessed after the session is closed
+
+    This helper logs detailed context to help identify the root cause.
     """
-    engine = create_async_engine(
-        config.DATABASE_URL,
-        poolclass=NullPool,  # Don't use connection pooling for Celery tasks
-        echo=False,
-    )
-    return async_sessionmaker(engine, expire_on_commit=False)
+    error_str = str(e)
+    if "greenlet_spawn has not been called" in error_str:
+        logger.error(
+            f"GREENLET ERROR in {task_name} for connector {connector_id}: {error_str}\n"
+            f"This error typically occurs when SQLAlchemy tries to lazy-load a relationship "
+            f"outside of an async context. Check for:\n"
+            f"1. Accessing relationship attributes (e.g., document.chunks, connector.search_space) "
+            f"without using selectinload() or joinedload()\n"
+            f"2. Accessing model attributes after the session is closed\n"
+            f"3. Passing ORM objects between different async contexts\n"
+            f"Stack trace:\n{traceback.format_exc()}"
+        )
+    else:
+        logger.error(
+            f"Error in {task_name} for connector {connector_id}: {error_str}\n"
+            f"Stack trace:\n{traceback.format_exc()}"
+        )
 
 
 @celery_app.task(name="index_slack_messages", bind=True)
@@ -46,6 +60,9 @@ def index_slack_messages_task(
                 connector_id, search_space_id, user_id, start_date, end_date
             )
         )
+    except Exception as e:
+        _handle_greenlet_error(e, "index_slack_messages", connector_id)
+        raise
     finally:
         loop.close()
 
@@ -89,6 +106,9 @@ def index_notion_pages_task(
                 connector_id, search_space_id, user_id, start_date, end_date
             )
         )
+    except Exception as e:
+        _handle_greenlet_error(e, "index_notion_pages", connector_id)
+        raise
     finally:
         loop.close()
 
@@ -347,6 +367,9 @@ def index_google_calendar_events_task(
                 connector_id, search_space_id, user_id, start_date, end_date
             )
         )
+    except Exception as e:
+        _handle_greenlet_error(e, "index_google_calendar_events", connector_id)
+        raise
     finally:
         loop.close()
 
@@ -445,31 +468,61 @@ async def _index_google_gmail_messages(
     end_date: str,
 ):
     """Index Google Gmail messages with new session."""
-    from datetime import datetime
-
     from app.routes.search_source_connectors_routes import (
         run_google_gmail_indexing,
     )
 
-    # Parse dates to calculate days_back
-    max_messages = 100
-    days_back = 30  # Default
-
-    if start_date:
-        try:
-            # Parse start_date (format: YYYY-MM-DD)
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-            # Calculate days back from now
-            days_back = (datetime.now() - start_dt).days
-            # Ensure at least 1 day
-            days_back = max(1, days_back)
-        except ValueError:
-            # If parsing fails, use default
-            days_back = 30
-
     async with get_celery_session_maker()() as session:
         await run_google_gmail_indexing(
-            session, connector_id, search_space_id, user_id, max_messages, days_back
+            session, connector_id, search_space_id, user_id, start_date, end_date
+        )
+
+
+@celery_app.task(name="index_google_drive_files", bind=True)
+def index_google_drive_files_task(
+    self,
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    items_dict: dict,  # Dictionary with 'folders', 'files', and 'indexing_options'
+):
+    """Celery task to index Google Drive folders and files."""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(
+            _index_google_drive_files(
+                connector_id,
+                search_space_id,
+                user_id,
+                items_dict,
+            )
+        )
+    finally:
+        loop.close()
+
+
+async def _index_google_drive_files(
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    items_dict: dict,  # Dictionary with 'folders', 'files', and 'indexing_options'
+):
+    """Index Google Drive folders and files with new session."""
+    from app.routes.search_source_connectors_routes import (
+        run_google_drive_indexing,
+    )
+
+    async with get_celery_session_maker()() as session:
+        await run_google_drive_indexing(
+            session,
+            connector_id,
+            search_space_id,
+            user_id,
+            items_dict,
         )
 
 
@@ -512,6 +565,49 @@ async def _index_discord_messages(
 
     async with get_celery_session_maker()() as session:
         await run_discord_indexing(
+            session, connector_id, search_space_id, user_id, start_date, end_date
+        )
+
+
+@celery_app.task(name="index_teams_messages", bind=True)
+def index_teams_messages_task(
+    self,
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+):
+    """Celery task to index Microsoft Teams messages."""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(
+            _index_teams_messages(
+                connector_id, search_space_id, user_id, start_date, end_date
+            )
+        )
+    finally:
+        loop.close()
+
+
+async def _index_teams_messages(
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+):
+    """Index Microsoft Teams messages with new session."""
+    from app.routes.search_source_connectors_routes import (
+        run_teams_indexing,
+    )
+
+    async with get_celery_session_maker()() as session:
+        await run_teams_indexing(
             session, connector_id, search_space_id, user_id, start_date, end_date
         )
 
@@ -623,6 +719,9 @@ def index_crawled_urls_task(
                 connector_id, search_space_id, user_id, start_date, end_date
             )
         )
+    except Exception as e:
+        _handle_greenlet_error(e, "index_crawled_urls", connector_id)
+        raise
     finally:
         loop.close()
 
@@ -684,5 +783,92 @@ async def _index_bookstack_pages(
 
     async with get_celery_session_maker()() as session:
         await run_bookstack_indexing(
+            session, connector_id, search_space_id, user_id, start_date, end_date
+        )
+
+
+@celery_app.task(name="index_obsidian_vault", bind=True)
+def index_obsidian_vault_task(
+    self,
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+):
+    """Celery task to index Obsidian vault notes."""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(
+            _index_obsidian_vault(
+                connector_id, search_space_id, user_id, start_date, end_date
+            )
+        )
+    finally:
+        loop.close()
+
+
+async def _index_obsidian_vault(
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+):
+    """Index Obsidian vault with new session."""
+    from app.routes.search_source_connectors_routes import (
+        run_obsidian_indexing,
+    )
+
+    async with get_celery_session_maker()() as session:
+        await run_obsidian_indexing(
+            session, connector_id, search_space_id, user_id, start_date, end_date
+        )
+
+
+@celery_app.task(name="index_composio_connector", bind=True)
+def index_composio_connector_task(
+    self,
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str | None,
+    end_date: str | None,
+):
+    """Celery task to index Composio connector content (Google Drive, Gmail, Calendar via Composio)."""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        loop.run_until_complete(
+            _index_composio_connector(
+                connector_id, search_space_id, user_id, start_date, end_date
+            )
+        )
+    finally:
+        loop.close()
+
+
+async def _index_composio_connector(
+    connector_id: int,
+    search_space_id: int,
+    user_id: str,
+    start_date: str | None,
+    end_date: str | None,
+):
+    """Index Composio connector content with new session and real-time notifications."""
+    # Import from routes to use the notification-wrapped version
+    from app.routes.search_source_connectors_routes import (
+        run_composio_indexing,
+    )
+
+    async with get_celery_session_maker()() as session:
+        await run_composio_indexing(
             session, connector_id, search_space_id, user_id, start_date, end_date
         )

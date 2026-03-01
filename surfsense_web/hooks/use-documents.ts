@@ -1,246 +1,483 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
-import { toast } from "sonner";
-import { authenticatedFetch } from "@/lib/auth-utils";
-import { normalizeListResponse } from "@/lib/pagination";
 
-export interface Document {
+import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DocumentTypeEnum } from "@/contracts/types/document.types";
+import { documentsApiService } from "@/lib/apis/documents-api.service";
+import type { SyncHandle } from "@/lib/electric/client";
+import { useElectricClient } from "@/lib/electric/context";
+
+// Stable empty array to prevent infinite re-renders when no typeFilter is provided
+const EMPTY_TYPE_FILTER: DocumentTypeEnum[] = [];
+
+// Document status type (matches backend DocumentStatus JSONB)
+export interface DocumentStatusType {
+	state: "ready" | "pending" | "processing" | "failed";
+	reason?: string;
+}
+
+// Document from Electric sync (lightweight table columns - NO content/metadata)
+interface DocumentElectric {
 	id: number;
-	title: string;
-	document_type: DocumentType;
-	document_metadata: any;
-	content: string;
-	created_at: string;
 	search_space_id: number;
+	document_type: string;
+	title: string;
+	created_by_id: string | null;
+	created_at: string;
+	status: DocumentStatusType | null;
 }
 
-export type DocumentType =
-	| "EXTENSION"
-	| "CRAWLED_URL"
-	| "SLACK_CONNECTOR"
-	| "NOTION_CONNECTOR"
-	| "FILE"
-	| "YOUTUBE_VIDEO"
-	| "GITHUB_CONNECTOR"
-	| "LINEAR_CONNECTOR"
-	| "DISCORD_CONNECTOR"
-	| "JIRA_CONNECTOR"
-	| "CONFLUENCE_CONNECTOR"
-	| "CLICKUP_CONNECTOR"
-	| "GOOGLE_CALENDAR_CONNECTOR"
-	| "GOOGLE_GMAIL_CONNECTOR"
-	| "AIRTABLE_CONNECTOR"
-	| "LUMA_CONNECTOR"
-	| "ELASTICSEARCH_CONNECTOR";
-
-export interface UseDocumentsOptions {
-	page?: number;
-	pageSize?: number;
-	lazy?: boolean;
-	documentTypes?: string[];
+// Document for display (with resolved user name and email)
+export interface DocumentDisplay {
+	id: number;
+	search_space_id: number;
+	document_type: string;
+	title: string;
+	created_by_id: string | null;
+	created_by_name: string | null;
+	created_by_email: string | null;
+	created_at: string;
+	status: DocumentStatusType;
 }
 
-export function useDocuments(searchSpaceId: number, options?: UseDocumentsOptions | boolean) {
-	// Support both old boolean API and new options API for backward compatibility
-	const opts = typeof options === "boolean" ? { lazy: options } : options || {};
-	const { page, pageSize = 300, lazy = false, documentTypes } = opts;
+/**
+ * Deduplicate by ID and sort by created_at descending (newest first)
+ */
+function deduplicateAndSort<T extends { id: number; created_at: string }>(items: T[]): T[] {
+	const seen = new Map<number, T>();
+	for (const item of items) {
+		// Keep the most recent version if duplicate
+		const existing = seen.get(item.id);
+		if (!existing || new Date(item.created_at) > new Date(existing.created_at)) {
+			seen.set(item.id, item);
+		}
+	}
+	return Array.from(seen.values()).sort(
+		(a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+	);
+}
 
-	const [documents, setDocuments] = useState<Document[]>([]);
-	const [total, setTotal] = useState(0);
-	const [loading, setLoading] = useState(!lazy); // Don't show loading initially for lazy mode
-	const [error, setError] = useState<string | null>(null);
-	const [isLoaded, setIsLoaded] = useState(false); // Memoization flag
+/**
+ * Check if a document has valid/complete data
+ */
+function isValidDocument(doc: DocumentElectric): boolean {
+	return doc.id != null && doc.title != null && doc.title !== "";
+}
 
-	const fetchDocuments = useCallback(
-		async (fetchPage?: number, fetchPageSize?: number, fetchDocumentTypes?: string[]) => {
-			if (isLoaded && lazy) return; // Avoid redundant calls in lazy mode
+/**
+ * Real-time documents hook with Electric SQL
+ *
+ * Architecture (100% Reliable):
+ * 1. API is the PRIMARY source of truth - always loads first
+ * 2. Electric provides REAL-TIME updates for additions and deletions
+ * 3. Use syncHandle.isUpToDate to determine if deletions can be trusted
+ * 4. Handles bulk deletions correctly by checking sync state
+ *
+ * Filtering strategy:
+ * - Internal state always stores ALL documents (unfiltered)
+ * - typeFilter is applied client-side when returning documents
+ * - typeCounts always reflect the full dataset so the filter sidebar stays complete
+ * - Changing filters is instant (no API re-fetch or Electric re-sync)
+ *
+ * @param searchSpaceId - The search space ID to filter documents
+ * @param typeFilter - Optional document types to filter by (applied client-side)
+ */
+export function useDocuments(
+	searchSpaceId: number | null,
+	typeFilter: DocumentTypeEnum[] = EMPTY_TYPE_FILTER
+) {
+	const electricClient = useElectricClient();
 
-			try {
-				setLoading(true);
+	// Internal state: ALL documents (unfiltered)
+	const [allDocuments, setAllDocuments] = useState<DocumentDisplay[]>([]);
+	const [loading, setLoading] = useState(true);
+	const [error, setError] = useState<Error | null>(null);
 
-				// Build query params
-				const params = new URLSearchParams({
-					search_space_id: searchSpaceId.toString(),
-				});
+	// Track if initial API load is complete (source of truth)
+	const apiLoadedRef = useRef(false);
 
-				// Use passed parameters or fall back to state/options
-				const effectivePage = fetchPage !== undefined ? fetchPage : page;
-				const effectivePageSize = fetchPageSize !== undefined ? fetchPageSize : pageSize;
-				const effectiveDocumentTypes =
-					fetchDocumentTypes !== undefined ? fetchDocumentTypes : documentTypes;
+	// User cache: userId → displayName / email
+	const userCacheRef = useRef<Map<string, string>>(new Map());
+	const emailCacheRef = useRef<Map<string, string>>(new Map());
 
-				if (effectivePage !== undefined) {
-					params.append("page", effectivePage.toString());
+	// Electric sync refs
+	const syncHandleRef = useRef<SyncHandle | null>(null);
+	const liveQueryRef = useRef<{ unsubscribe?: () => void } | null>(null);
+
+	// Type counts from ALL documents (unfiltered) — keeps filter sidebar complete
+	const typeCounts = useMemo(() => {
+		const counts: Record<string, number> = {};
+		for (const doc of allDocuments) {
+			counts[doc.document_type] = (counts[doc.document_type] || 0) + 1;
+		}
+		return counts;
+	}, [allDocuments]);
+
+	// Client-side filtered documents for display
+	const documents = useMemo(() => {
+		if (typeFilter.length === 0) return allDocuments;
+		const filterSet = new Set<string>(typeFilter);
+		return allDocuments.filter((doc) => filterSet.has(doc.document_type));
+	}, [allDocuments, typeFilter]);
+
+	// Populate user cache from API response
+	const populateUserCache = useCallback(
+		(
+			items: Array<{
+				created_by_id?: string | null;
+				created_by_name?: string | null;
+				created_by_email?: string | null;
+			}>
+		) => {
+			for (const item of items) {
+				if (item.created_by_id) {
+					if (item.created_by_name) {
+						userCacheRef.current.set(item.created_by_id, item.created_by_name);
+					}
+					if (item.created_by_email) {
+						emailCacheRef.current.set(item.created_by_id, item.created_by_email);
+					}
 				}
-				if (effectivePageSize !== undefined) {
-					params.append("page_size", effectivePageSize.toString());
-				}
-				if (effectiveDocumentTypes && effectiveDocumentTypes.length > 0) {
-					params.append("document_types", effectiveDocumentTypes.join(","));
-				}
-
-				const response = await authenticatedFetch(
-					`${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/api/v1/documents?${params.toString()}`,
-					{ method: "GET" }
-				);
-
-				if (!response.ok) {
-					toast.error("Failed to fetch documents");
-					throw new Error("Failed to fetch documents");
-				}
-
-				const data = await response.json();
-				const normalized = normalizeListResponse<Document>(data);
-				setDocuments(normalized.items);
-				setTotal(normalized.total);
-				setError(null);
-				setIsLoaded(true);
-			} catch (err: any) {
-				setError(err.message || "Failed to fetch documents");
-				console.error("Error fetching documents:", err);
-			} finally {
-				setLoading(false);
 			}
 		},
-		[searchSpaceId, page, pageSize, documentTypes, isLoaded, lazy]
+		[]
 	);
+
+	// Convert API item to display doc
+	const apiToDisplayDoc = useCallback(
+		(item: {
+			id: number;
+			search_space_id: number;
+			document_type: string;
+			title: string;
+			created_by_id?: string | null;
+			created_by_name?: string | null;
+			created_by_email?: string | null;
+			created_at: string;
+			status?: DocumentStatusType | null;
+		}): DocumentDisplay => ({
+			id: item.id,
+			search_space_id: item.search_space_id,
+			document_type: item.document_type,
+			title: item.title,
+			created_by_id: item.created_by_id ?? null,
+			created_by_name: item.created_by_name ?? null,
+			created_by_email: item.created_by_email ?? null,
+			created_at: item.created_at,
+			status: item.status ?? { state: "ready" },
+		}),
+		[]
+	);
+
+	// Convert Electric doc to display doc
+	const electricToDisplayDoc = useCallback(
+		(doc: DocumentElectric): DocumentDisplay => ({
+			...doc,
+			created_by_name: doc.created_by_id
+				? (userCacheRef.current.get(doc.created_by_id) ?? null)
+				: null,
+			created_by_email: doc.created_by_id
+				? (emailCacheRef.current.get(doc.created_by_id) ?? null)
+				: null,
+			status: doc.status ?? { state: "ready" },
+		}),
+		[]
+	);
+
+	// STEP 1: Load ALL documents from API (PRIMARY source of truth).
+	// Uses React Query for automatic deduplication, caching, and staleTime so
+	// multiple components mounting useDocuments(sameId) share a single request.
+	const {
+		data: apiResponse,
+		isLoading: apiLoading,
+		error: apiError,
+	} = useQuery({
+		queryKey: ["documents", "all", searchSpaceId],
+		queryFn: () =>
+			documentsApiService.getDocuments({
+				queryParams: {
+					search_space_id: searchSpaceId!,
+					page: 0,
+					page_size: -1,
+				},
+			}),
+		enabled: !!searchSpaceId,
+		staleTime: 30_000,
+	});
+
+	// Seed local state from API response (runs once per fresh fetch)
+	useEffect(() => {
+		if (!apiResponse) return;
+		populateUserCache(apiResponse.items);
+		const docs = apiResponse.items.map(apiToDisplayDoc);
+		setAllDocuments(docs);
+		apiLoadedRef.current = true;
+		setError(null);
+	}, [apiResponse, populateUserCache, apiToDisplayDoc]);
+
+	// Propagate loading / error from React Query
+	useEffect(() => {
+		setLoading(apiLoading);
+	}, [apiLoading]);
 
 	useEffect(() => {
-		if (!lazy && searchSpaceId) {
-			fetchDocuments();
+		if (apiError) {
+			setError(apiError instanceof Error ? apiError : new Error("Failed to load documents"));
 		}
-	}, [searchSpaceId, lazy, fetchDocuments]);
+	}, [apiError]);
 
-	// Function to refresh the documents list
-	const refreshDocuments = useCallback(async () => {
-		setIsLoaded(false); // Reset memoization flag to allow refetch
-		await fetchDocuments();
-	}, [fetchDocuments]);
+	// EFFECT 2: Start Electric sync + live query for real-time updates
+	// No type filter — syncs and queries ALL documents; filtering is client-side
+	useEffect(() => {
+		if (!searchSpaceId || !electricClient) return;
 
-	// Function to search documents by title
-	const searchDocuments = useCallback(
-		async (
-			searchQuery: string,
-			fetchPage?: number,
-			fetchPageSize?: number,
-			fetchDocumentTypes?: string[]
-		) => {
-			if (!searchQuery.trim()) {
-				// If search is empty, fetch all documents
-				return fetchDocuments(fetchPage, fetchPageSize, fetchDocumentTypes);
+		// Capture validated values for async closure
+		const spaceId = searchSpaceId;
+		const client = electricClient;
+
+		let mounted = true;
+
+		async function setupElectricRealtime() {
+			// Cleanup previous subscriptions
+			if (syncHandleRef.current) {
+				try {
+					syncHandleRef.current.unsubscribe();
+				} catch {
+					// PGlite may already be closed during cleanup
+				}
+				syncHandleRef.current = null;
+			}
+			if (liveQueryRef.current) {
+				try {
+					liveQueryRef.current.unsubscribe?.();
+				} catch {
+					// PGlite may already be closed during cleanup
+				}
+				liveQueryRef.current = null;
 			}
 
 			try {
-				setLoading(true);
+				console.log("[useDocuments] Starting Electric sync for real-time updates");
 
-				// Build query params
-				const params = new URLSearchParams({
-					search_space_id: searchSpaceId.toString(),
-					title: searchQuery,
+				// Start Electric sync (all documents for this search space)
+				const handle = await client.syncShape({
+					table: "documents",
+					where: `search_space_id = ${spaceId}`,
+					columns: [
+						"id",
+						"document_type",
+						"search_space_id",
+						"title",
+						"created_by_id",
+						"created_at",
+						"status",
+					],
+					primaryKey: ["id"],
 				});
 
-				// Use passed parameters or fall back to state/options
-				const effectivePage = fetchPage !== undefined ? fetchPage : page;
-				const effectivePageSize = fetchPageSize !== undefined ? fetchPageSize : pageSize;
-				const effectiveDocumentTypes =
-					fetchDocumentTypes !== undefined ? fetchDocumentTypes : documentTypes;
-
-				if (effectivePage !== undefined) {
-					params.append("page", effectivePage.toString());
-				}
-				if (effectivePageSize !== undefined) {
-					params.append("page_size", effectivePageSize.toString());
-				}
-				if (effectiveDocumentTypes && effectiveDocumentTypes.length > 0) {
-					params.append("document_types", effectiveDocumentTypes.join(","));
+				if (!mounted) {
+					handle.unsubscribe();
+					return;
 				}
 
-				const response = await authenticatedFetch(
-					`${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/api/v1/documents/search?${params.toString()}`,
-					{ method: "GET" }
-				);
+				syncHandleRef.current = handle;
+				console.log("[useDocuments] Sync started, isUpToDate:", handle.isUpToDate);
 
-				if (!response.ok) {
-					toast.error("Failed to search documents");
-					throw new Error("Failed to search documents");
+				// Wait for initial sync (with timeout)
+				if (!handle.isUpToDate && handle.initialSyncPromise) {
+					await Promise.race([
+						handle.initialSyncPromise,
+						new Promise((resolve) => setTimeout(resolve, 5000)),
+					]);
+					console.log("[useDocuments] Initial sync complete, isUpToDate:", handle.isUpToDate);
 				}
 
-				const data = await response.json();
-				const normalized = normalizeListResponse<Document>(data);
-				setDocuments(normalized.items);
-				setTotal(normalized.total);
-				setError(null);
-			} catch (err: any) {
-				setError(err.message || "Failed to search documents");
-				console.error("Error searching documents:", err);
-			} finally {
-				setLoading(false);
+				if (!mounted) return;
+
+				// Set up live query (unfiltered — type filtering is done client-side)
+				const db = client.db as {
+					live?: {
+						query: <T>(
+							sql: string,
+							params?: (number | string)[]
+						) => Promise<{
+							subscribe: (cb: (result: { rows: T[] }) => void) => void;
+							unsubscribe?: () => void;
+						}>;
+					};
+				};
+
+				if (!db.live?.query) {
+					console.warn("[useDocuments] Live queries not available");
+					return;
+				}
+
+				const query = `SELECT id, document_type, search_space_id, title, created_by_id, created_at, status
+					FROM documents 
+					WHERE search_space_id = $1
+					ORDER BY created_at DESC`;
+
+				const liveQuery = await db.live.query<DocumentElectric>(query, [spaceId]);
+
+				if (!mounted) {
+					liveQuery.unsubscribe?.();
+					return;
+				}
+
+				console.log("[useDocuments] Live query subscribed");
+
+				liveQuery.subscribe((result: { rows: DocumentElectric[] }) => {
+					if (!mounted || !result.rows) return;
+
+					// DEBUG: Log first few raw documents to see what's coming from Electric
+					console.log("[useDocuments] Raw data sample:", result.rows.slice(0, 3));
+
+					const validItems = result.rows.filter(isValidDocument);
+					const isFullySynced = syncHandleRef.current?.isUpToDate ?? false;
+
+					console.log(
+						`[useDocuments] Live update: ${result.rows.length} raw, ${validItems.length} valid, synced: ${isFullySynced}`
+					);
+
+					// Fetch user names for new users (non-blocking)
+					const unknownUserIds = validItems
+						.filter(
+							(doc): doc is DocumentElectric & { created_by_id: string } =>
+								doc.created_by_id !== null && !userCacheRef.current.has(doc.created_by_id)
+						)
+						.map((doc) => doc.created_by_id);
+
+					if (unknownUserIds.length > 0) {
+						documentsApiService
+							.getDocuments({
+								queryParams: { search_space_id: spaceId, page: 0, page_size: 20 },
+							})
+							.then((response) => {
+								populateUserCache(response.items);
+								if (mounted) {
+									setAllDocuments((prev) =>
+										prev.map((doc) => ({
+											...doc,
+											created_by_name: doc.created_by_id
+												? (userCacheRef.current.get(doc.created_by_id) ?? null)
+												: null,
+											created_by_email: doc.created_by_id
+												? (emailCacheRef.current.get(doc.created_by_id) ?? null)
+												: null,
+										}))
+									);
+								}
+							})
+							.catch(() => {});
+					}
+
+					// Smart update logic based on sync state
+					setAllDocuments((prev) => {
+						// Don't process if API hasn't loaded yet
+						if (!apiLoadedRef.current) {
+							console.log("[useDocuments] Waiting for API load, skipping live update");
+							return prev;
+						}
+
+						// Case 1: Live query is empty
+						if (validItems.length === 0) {
+							if (isFullySynced && prev.length > 0) {
+								// Electric is fully synced and says 0 items - trust it (all deleted)
+								console.log("[useDocuments] All documents deleted (Electric synced)");
+								return [];
+							}
+							// Partial sync or error - keep existing
+							console.log("[useDocuments] Empty live result, keeping existing");
+							return prev;
+						}
+
+						// Case 2: Electric is fully synced - TRUST IT COMPLETELY (handles bulk deletes)
+						if (isFullySynced) {
+							const liveDocs = deduplicateAndSort(validItems.map(electricToDisplayDoc));
+							console.log(
+								`[useDocuments] Synced update: ${liveDocs.length} docs (was ${prev.length})`
+							);
+							return liveDocs;
+						}
+
+						// Case 3: Partial sync - only ADD new items, don't remove any
+						const existingIds = new Set(prev.map((d) => d.id));
+						const liveIds = new Set(validItems.map((d) => d.id));
+
+						// Find new items (in live but not in prev)
+						const newItems = validItems
+							.filter((item) => !existingIds.has(item.id))
+							.map(electricToDisplayDoc);
+
+						// Find updated items (in both, update with latest data)
+						const updatedPrev = prev.map((doc) => {
+							if (liveIds.has(doc.id)) {
+								const liveItem = validItems.find((v) => v.id === doc.id);
+								if (liveItem) {
+									return electricToDisplayDoc(liveItem);
+								}
+							}
+							return doc;
+						});
+
+						if (newItems.length > 0) {
+							console.log(`[useDocuments] Adding ${newItems.length} new items (partial sync)`);
+							return deduplicateAndSort([...newItems, ...updatedPrev]);
+						}
+
+						return updatedPrev;
+					});
+				});
+
+				liveQueryRef.current = liveQuery;
+			} catch (err) {
+				console.error("[useDocuments] Electric setup failed:", err);
+				// Don't set error - API data is already loaded
 			}
-		},
-		[searchSpaceId, page, pageSize, documentTypes, fetchDocuments]
-	);
-
-	// Function to delete a document
-	const deleteDocument = useCallback(
-		async (documentId: number) => {
-			try {
-				const response = await authenticatedFetch(
-					`${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/api/v1/documents/${documentId}`,
-					{ method: "DELETE" }
-				);
-
-				if (!response.ok) {
-					toast.error("Failed to delete document");
-					throw new Error("Failed to delete document");
-				}
-
-				toast.success("Document deleted successfully");
-				// Update the local state after successful deletion
-				setDocuments(documents.filter((doc) => doc.id !== documentId));
-				return true;
-			} catch (err: any) {
-				toast.error(err.message || "Failed to delete document");
-				console.error("Error deleting document:", err);
-				return false;
-			}
-		},
-		[documents]
-	);
-
-	// Function to get document type counts
-	const getDocumentTypeCounts = useCallback(async () => {
-		try {
-			const params = new URLSearchParams({
-				search_space_id: searchSpaceId.toString(),
-			});
-
-			const response = await authenticatedFetch(
-				`${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/api/v1/documents/type-counts?${params.toString()}`,
-				{ method: "GET" }
-			);
-
-			if (!response.ok) {
-				throw new Error("Failed to fetch document type counts");
-			}
-
-			const counts = await response.json();
-			return counts as Record<string, number>;
-		} catch (err: any) {
-			console.error("Error fetching document type counts:", err);
-			return {};
 		}
+
+		setupElectricRealtime();
+
+		return () => {
+			mounted = false;
+			if (syncHandleRef.current) {
+				try {
+					syncHandleRef.current.unsubscribe();
+				} catch {
+					// PGlite may already be closed during cleanup
+				}
+				syncHandleRef.current = null;
+			}
+			if (liveQueryRef.current) {
+				try {
+					liveQueryRef.current.unsubscribe?.();
+				} catch {
+					// PGlite may already be closed during cleanup
+				}
+				liveQueryRef.current = null;
+			}
+		};
+	}, [searchSpaceId, electricClient, electricToDisplayDoc, populateUserCache]);
+
+	// Track previous searchSpaceId to detect actual changes
+	const prevSearchSpaceIdRef = useRef<number | null>(null);
+
+	// Reset on search space change (not on initial mount)
+	useEffect(() => {
+		if (prevSearchSpaceIdRef.current !== null && prevSearchSpaceIdRef.current !== searchSpaceId) {
+			setAllDocuments([]);
+			apiLoadedRef.current = false;
+			userCacheRef.current.clear();
+			emailCacheRef.current.clear();
+		}
+		prevSearchSpaceIdRef.current = searchSpaceId;
 	}, [searchSpaceId]);
 
 	return {
 		documents,
-		total,
+		typeCounts,
+		total: documents.length,
 		loading,
 		error,
-		isLoaded,
-		fetchDocuments, // Manual fetch function for lazy mode
-		searchDocuments, // Search function
-		refreshDocuments,
-		deleteDocument,
-		getDocumentTypeCounts, // Get type counts function
 	};
 }

@@ -1,9 +1,12 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import { GoogleAnalytics } from "@next/third-parties/google";
-import { RootProvider } from "fumadocs-ui/provider";
+import { RootProvider } from "fumadocs-ui/provider/next";
 import { Roboto } from "next/font/google";
+import { AnnouncementToastProvider } from "@/components/announcements/AnnouncementToastProvider";
+import { ElectricProvider } from "@/components/providers/ElectricProvider";
+import { GlobalLoadingProvider } from "@/components/providers/GlobalLoadingProvider";
 import { I18nProvider } from "@/components/providers/I18nProvider";
+import { PostHogProvider } from "@/components/providers/PostHogProvider";
 import { ThemeProvider } from "@/components/theme/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { LocaleProvider } from "@/contexts/LocaleContext";
@@ -16,6 +19,20 @@ const roboto = Roboto({
 	display: "swap",
 	variable: "--font-roboto",
 });
+
+/**
+ * Viewport configuration for mobile keyboard handling.
+ * - interactiveWidget: 'resizes-content' tells mobile browsers (especially Chrome Android)
+ *   to resize the CSS layout viewport when the virtual keyboard opens, so sticky elements
+ *   (like the chat input bar) stay visible above the keyboard.
+ * - viewportFit: 'cover' enables env(safe-area-inset-*) for notched/home-indicator devices.
+ */
+export const viewport: Viewport = {
+	width: "device-width",
+	initialScale: 1,
+	viewportFit: "cover",
+	interactiveWidget: "resizes-content",
+};
 
 export const metadata: Metadata = {
 	title: "SurfSense – Customizable AI Research & Knowledge Management Assistant",
@@ -91,23 +108,29 @@ export default function RootLayout({
 	// Locale state is managed by LocaleContext and persisted in localStorage
 	return (
 		<html lang="en" suppressHydrationWarning>
-			<GoogleAnalytics gaId="G-T4CHE7W3TE" />
 			<body className={cn(roboto.className, "bg-white dark:bg-black antialiased h-full w-full ")}>
-				<LocaleProvider>
-					<I18nProvider>
-						<ThemeProvider
-							attribute="class"
-							enableSystem
-							disableTransitionOnChange
-							defaultTheme="light"
-						>
-							<RootProvider>
-								<ReactQueryClientProvider>{children}</ReactQueryClientProvider>
-								<Toaster />
-							</RootProvider>
-						</ThemeProvider>
-					</I18nProvider>
-				</LocaleProvider>
+				<PostHogProvider>
+					<LocaleProvider>
+						<I18nProvider>
+							<ThemeProvider
+								attribute="class"
+								enableSystem
+								disableTransitionOnChange
+								defaultTheme="system"
+							>
+								<RootProvider>
+									<ReactQueryClientProvider>
+										<ElectricProvider>
+											<GlobalLoadingProvider>{children}</GlobalLoadingProvider>
+										</ElectricProvider>
+									</ReactQueryClientProvider>
+									<Toaster />
+									<AnnouncementToastProvider />
+								</RootProvider>
+							</ThemeProvider>
+						</I18nProvider>
+					</LocaleProvider>
+				</PostHogProvider>
 			</body>
 		</html>
 	);

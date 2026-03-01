@@ -4,28 +4,59 @@
 
 const REDIRECT_PATH_KEY = "surfsense_redirect_path";
 const BEARER_TOKEN_KEY = "surfsense_bearer_token";
+const REFRESH_TOKEN_KEY = "surfsense_refresh_token";
+
+// Flag to prevent multiple simultaneous refresh attempts
+let isRefreshing = false;
+let refreshPromise: Promise<string | null> | null = null;
+
+/** Path prefixes for routes that do not require auth (no current-user fetch, no redirect on 401) */
+const PUBLIC_ROUTE_PREFIXES = [
+	"/login",
+	"/register",
+	"/auth",
+	"/docs",
+	"/public",
+	"/invite",
+	"/contact",
+	"/pricing",
+	"/privacy",
+	"/terms",
+	"/changelog",
+];
 
 /**
- * Saves the current path and redirects to login page
- * Call this when a 401 response is received
+ * Returns true if the pathname is a public route where we should not run auth checks
+ * or redirect to login on 401.
+ */
+export function isPublicRoute(pathname: string): boolean {
+	if (pathname === "/" || pathname === "") return true;
+	return PUBLIC_ROUTE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
+/**
+ * Clears tokens and optionally redirects to login.
+ * Call this when a 401 response is received.
+ * Only redirects when the current route is protected; on public routes we just clear tokens.
  */
 export function handleUnauthorized(): void {
 	if (typeof window === "undefined") return;
 
-	// Save the current path (including search params and hash) for redirect after login
-	const currentPath = window.location.pathname + window.location.search + window.location.hash;
+	const pathname = window.location.pathname;
 
-	// Don't save auth-related paths
-	const excludedPaths = ["/auth", "/auth/callback", "/"];
-	if (!excludedPaths.includes(window.location.pathname)) {
-		localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
-	}
-
-	// Clear the token
+	// Always clear tokens
 	localStorage.removeItem(BEARER_TOKEN_KEY);
+	localStorage.removeItem(REFRESH_TOKEN_KEY);
 
-	// Redirect to home page (which has login options)
-	window.location.href = "/login";
+	// Only redirect on protected routes; stay on public pages (e.g. /docs)
+	if (!isPublicRoute(pathname)) {
+		const currentPath = pathname + window.location.search + window.location.hash;
+		const excludedPaths = ["/auth", "/auth/callback", "/"];
+		if (!excludedPaths.includes(pathname)) {
+			localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
+		}
+		window.location.href = "/login";
+	}
 }
 
 /**
@@ -64,6 +95,71 @@ export function setBearerToken(token: string): void {
 export function clearBearerToken(): void {
 	if (typeof window === "undefined") return;
 	localStorage.removeItem(BEARER_TOKEN_KEY);
+}
+
+/**
+ * Gets the refresh token from localStorage
+ */
+export function getRefreshToken(): string | null {
+	if (typeof window === "undefined") return null;
+	return localStorage.getItem(REFRESH_TOKEN_KEY);
+}
+
+/**
+ * Sets the refresh token in localStorage
+ */
+export function setRefreshToken(token: string): void {
+	if (typeof window === "undefined") return;
+	localStorage.setItem(REFRESH_TOKEN_KEY, token);
+}
+
+/**
+ * Clears the refresh token from localStorage
+ */
+export function clearRefreshToken(): void {
+	if (typeof window === "undefined") return;
+	localStorage.removeItem(REFRESH_TOKEN_KEY);
+}
+
+/**
+ * Clears all auth tokens from localStorage
+ */
+export function clearAllTokens(): void {
+	clearBearerToken();
+	clearRefreshToken();
+}
+
+/**
+ * Logout the current user by revoking the refresh token and clearing localStorage.
+ * Returns true if logout was successful (or tokens were cleared), false otherwise.
+ */
+export async function logout(): Promise<boolean> {
+	const refreshToken = getRefreshToken();
+
+	// Call backend to revoke the refresh token
+	if (refreshToken) {
+		try {
+			const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
+			const response = await fetch(`${backendUrl}/auth/jwt/revoke`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ refresh_token: refreshToken }),
+			});
+
+			if (!response.ok) {
+				console.warn("Failed to revoke refresh token:", response.status, await response.text());
+			}
+		} catch (error) {
+			console.warn("Failed to revoke refresh token on server:", error);
+			// Continue to clear local tokens even if server call fails
+		}
+	}
+
+	// Clear all tokens from localStorage
+	clearAllTokens();
+	return true;
 }
 
 /**
@@ -106,14 +202,66 @@ export function getAuthHeaders(additionalHeaders?: Record<string, string>): Reco
 }
 
 /**
- * Authenticated fetch wrapper that handles 401 responses uniformly
- * Automatically redirects to login on 401 and saves the current path
+ * Attempts to refresh the access token using the stored refresh token.
+ * Returns the new access token if successful, null otherwise.
+ */
+export async function refreshAccessToken(): Promise<string | null> {
+	// If already refreshing, wait for that request to complete
+	if (isRefreshing && refreshPromise) {
+		return refreshPromise;
+	}
+
+	const currentRefreshToken = getRefreshToken();
+	if (!currentRefreshToken) {
+		return null;
+	}
+
+	isRefreshing = true;
+	refreshPromise = (async () => {
+		try {
+			const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
+			const response = await fetch(`${backendUrl}/auth/jwt/refresh`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ refresh_token: currentRefreshToken }),
+			});
+
+			if (!response.ok) {
+				// Refresh failed, clear tokens
+				clearAllTokens();
+				return null;
+			}
+
+			const data = await response.json();
+			if (data.access_token && data.refresh_token) {
+				setBearerToken(data.access_token);
+				setRefreshToken(data.refresh_token);
+				return data.access_token;
+			}
+			return null;
+		} catch {
+			return null;
+		} finally {
+			isRefreshing = false;
+			refreshPromise = null;
+		}
+	})();
+
+	return refreshPromise;
+}
+
+/**
+ * Authenticated fetch wrapper that handles 401 responses uniformly.
+ * On 401, attempts to refresh the token and retry the request.
+ * If refresh fails, redirects to login and saves the current path.
  */
 export async function authenticatedFetch(
 	url: string,
-	options?: RequestInit & { skipAuthRedirect?: boolean }
+	options?: RequestInit & { skipAuthRedirect?: boolean; skipRefresh?: boolean }
 ): Promise<Response> {
-	const { skipAuthRedirect = false, ...fetchOptions } = options || {};
+	const { skipAuthRedirect = false, skipRefresh = false, ...fetchOptions } = options || {};
 
 	const headers = getAuthHeaders(fetchOptions.headers as Record<string, string>);
 
@@ -124,50 +272,26 @@ export async function authenticatedFetch(
 
 	// Handle 401 Unauthorized
 	if (response.status === 401 && !skipAuthRedirect) {
+		// Try to refresh the token (unless skipRefresh is set to prevent infinite loops)
+		if (!skipRefresh) {
+			const newToken = await refreshAccessToken();
+			if (newToken) {
+				// Retry the original request with the new token
+				const retryHeaders = {
+					...(fetchOptions.headers as Record<string, string>),
+					Authorization: `Bearer ${newToken}`,
+				};
+				return fetch(url, {
+					...fetchOptions,
+					headers: retryHeaders,
+				});
+			}
+		}
+
+		// Refresh failed or was skipped, redirect to login
 		handleUnauthorized();
 		throw new Error("Unauthorized: Redirecting to login page");
 	}
 
 	return response;
-}
-
-/**
- * Type for the result of a fetch operation with built-in error handling
- */
-export type FetchResult<T> =
-	| { success: true; data: T; response: Response }
-	| { success: false; error: string; status?: number };
-
-/**
- * Authenticated fetch with JSON response handling
- * Returns a result object instead of throwing on non-401 errors
- */
-export async function authenticatedFetchJson<T = unknown>(
-	url: string,
-	options?: RequestInit & { skipAuthRedirect?: boolean }
-): Promise<FetchResult<T>> {
-	try {
-		const response = await authenticatedFetch(url, options);
-
-		if (!response.ok) {
-			const errorData = await response.json().catch(() => ({}));
-			return {
-				success: false,
-				error: errorData.detail || `Request failed: ${response.status}`,
-				status: response.status,
-			};
-		}
-
-		const data = await response.json();
-		return { success: true, data, response };
-	} catch (err: any) {
-		// Re-throw if it's the unauthorized redirect
-		if (err.message?.includes("Unauthorized")) {
-			throw err;
-		}
-		return {
-			success: false,
-			error: err.message || "Request failed",
-		};
-	}
 }

@@ -109,10 +109,48 @@ class GoogleCalendarConnector:
                         raise RuntimeError(
                             "GOOGLE_CALENDAR_CONNECTOR connector not found; cannot persist refreshed token."
                         )
-                    connector.config = json.loads(self._credentials.to_json())
+
+                    # Encrypt sensitive credentials before storing
+                    from app.config import config
+                    from app.utils.oauth_security import TokenEncryption
+
+                    creds_dict = json.loads(self._credentials.to_json())
+                    token_encrypted = connector.config.get("_token_encrypted", False)
+
+                    if token_encrypted and config.SECRET_KEY:
+                        token_encryption = TokenEncryption(config.SECRET_KEY)
+                        # Encrypt sensitive fields
+                        if creds_dict.get("token"):
+                            creds_dict["token"] = token_encryption.encrypt_token(
+                                creds_dict["token"]
+                            )
+                        if creds_dict.get("refresh_token"):
+                            creds_dict["refresh_token"] = (
+                                token_encryption.encrypt_token(
+                                    creds_dict["refresh_token"]
+                                )
+                            )
+                        if creds_dict.get("client_secret"):
+                            creds_dict["client_secret"] = (
+                                token_encryption.encrypt_token(
+                                    creds_dict["client_secret"]
+                                )
+                            )
+                        creds_dict["_token_encrypted"] = True
+
+                    connector.config = creds_dict
                     flag_modified(connector, "config")
                     await self._session.commit()
             except Exception as e:
+                error_str = str(e)
+                # Check if this is an invalid_grant error (token expired/revoked)
+                if (
+                    "invalid_grant" in error_str.lower()
+                    or "token has been expired or revoked" in error_str.lower()
+                ):
+                    raise Exception(
+                        "Google Calendar authentication failed. Please re-authenticate."
+                    ) from e
                 raise Exception(
                     f"Failed to refresh Google OAuth credentials: {e!s}"
                 ) from e
@@ -136,6 +174,14 @@ class GoogleCalendarConnector:
             self.service = build("calendar", "v3", credentials=credentials)
             return self.service
         except Exception as e:
+            error_str = str(e)
+            # If the error already contains a user-friendly re-authentication message, preserve it
+            if (
+                "re-authenticate" in error_str.lower()
+                or "expired or been revoked" in error_str.lower()
+                or "authentication failed" in error_str.lower()
+            ):
+                raise Exception(error_str) from e
             raise Exception(f"Failed to create Google Calendar service: {e!s}") from e
 
     async def get_calendars(self) -> tuple[list[dict[str, Any]], str | None]:
@@ -182,21 +228,40 @@ class GoogleCalendarConnector:
             Tuple containing (events list, error message or None)
         """
         try:
+            # Validate date strings
+            if not start_date or start_date.lower() in ("undefined", "null", "none"):
+                return (
+                    [],
+                    "Invalid start_date: must be a valid date string in YYYY-MM-DD format",
+                )
+            if not end_date or end_date.lower() in ("undefined", "null", "none"):
+                return (
+                    [],
+                    "Invalid end_date: must be a valid date string in YYYY-MM-DD format",
+                )
+
             service = await self._get_service()
 
             # Parse both dates
             dt_start = isoparse(start_date)
             dt_end = isoparse(end_date)
 
+            # Set start to beginning of day (00:00:00) and end to end of day (23:59:59)
+            # This ensures same-date queries work (e.g., start=2026-01-23, end=2026-01-23)
+            # and matches the Composio connector behavior
             if dt_start.tzinfo is None:
-                dt_start = dt_start.replace(tzinfo=pytz.UTC)
+                dt_start = dt_start.replace(hour=0, minute=0, second=0, tzinfo=pytz.UTC)
             else:
-                dt_start = dt_start.astimezone(pytz.UTC)
+                dt_start = dt_start.astimezone(pytz.UTC).replace(
+                    hour=0, minute=0, second=0
+                )
 
             if dt_end.tzinfo is None:
-                dt_end = dt_end.replace(tzinfo=pytz.UTC)
+                dt_end = dt_end.replace(hour=23, minute=59, second=59, tzinfo=pytz.UTC)
             else:
-                dt_end = dt_end.astimezone(pytz.UTC)
+                dt_end = dt_end.astimezone(pytz.UTC).replace(
+                    hour=23, minute=59, second=59
+                )
 
             if dt_start >= dt_end:
                 return [], (
@@ -230,6 +295,14 @@ class GoogleCalendarConnector:
             return events, None
 
         except Exception as e:
+            error_str = str(e)
+            # If the error already contains a user-friendly re-authentication message, preserve it
+            if (
+                "re-authenticate" in error_str.lower()
+                or "expired or been revoked" in error_str.lower()
+                or "authentication failed" in error_str.lower()
+            ):
+                return [], error_str
             return [], f"Error fetching events: {e!s}"
 
     def format_event_to_markdown(self, event: dict[str, Any]) -> str:

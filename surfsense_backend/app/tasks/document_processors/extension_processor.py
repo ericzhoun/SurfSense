@@ -20,6 +20,7 @@ from app.utils.document_converters import (
 
 from .base import (
     check_document_by_unique_identifier,
+    get_current_timestamp,
 )
 
 
@@ -145,16 +146,6 @@ async def add_extension_received_document(
         # Process chunks
         chunks = await create_document_chunks(content.pageContent)
 
-        from app.utils.blocknote_converter import convert_markdown_to_blocknote
-
-        # Convert markdown to BlockNote JSON
-        blocknote_json = await convert_markdown_to_blocknote(combined_document_string)
-        if not blocknote_json:
-            logging.warning(
-                f"Failed to convert extension document '{content.metadata.VisitedWebPageTitle}' "
-                f"to BlockNote JSON, document will not be editable"
-            )
-
         # Update or create document
         if existing_document:
             # Update existing document
@@ -164,7 +155,8 @@ async def add_extension_received_document(
             existing_document.embedding = summary_embedding
             existing_document.document_metadata = content.metadata.model_dump()
             existing_document.chunks = chunks
-            existing_document.blocknote_document = blocknote_json
+            existing_document.source_markdown = combined_document_string
+            existing_document.updated_at = get_current_timestamp()
 
             await session.commit()
             await session.refresh(existing_document)
@@ -181,7 +173,9 @@ async def add_extension_received_document(
                 chunks=chunks,
                 content_hash=content_hash,
                 unique_identifier_hash=unique_identifier_hash,
-                blocknote_document=blocknote_json,
+                source_markdown=combined_document_string,
+                updated_at=get_current_timestamp(),
+                created_by_id=user_id,
             )
 
             session.add(document)

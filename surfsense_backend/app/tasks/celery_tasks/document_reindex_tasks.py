@@ -3,31 +3,20 @@
 import logging
 
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
-from sqlalchemy.pool import NullPool
 
 from app.celery_app import celery_app
-from app.config import config
 from app.db import Document
 from app.services.llm_service import get_user_long_context_llm
-from app.utils.blocknote_converter import convert_blocknote_to_markdown
+from app.services.task_logging_service import TaskLoggingService
+from app.tasks.celery_tasks import get_celery_session_maker
 from app.utils.document_converters import (
     create_document_chunks,
     generate_document_summary,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def get_celery_session_maker():
-    """Create async session maker for Celery tasks."""
-    engine = create_async_engine(
-        config.DATABASE_URL,
-        poolclass=NullPool,
-        echo=False,
-    )
-    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 @celery_app.task(name="reindex_document", bind=True)
@@ -53,51 +42,66 @@ def reindex_document_task(self, document_id: int, user_id: str):
 async def _reindex_document(document_id: int, user_id: str):
     """Async function to reindex a document."""
     async with get_celery_session_maker()() as session:
+        # First, get the document to get search_space_id for logging
+        result = await session.execute(
+            select(Document)
+            .options(selectinload(Document.chunks))
+            .where(Document.id == document_id)
+        )
+        document = result.scalars().first()
+
+        if not document:
+            logger.error(f"Document {document_id} not found")
+            return
+
+        # Initialize task logger
+        task_logger = TaskLoggingService(session, document.search_space_id)
+
+        # Log task start
+        log_entry = await task_logger.log_task_start(
+            task_name="document_reindex",
+            source="editor",
+            message=f"Starting reindex for document: {document.title}",
+            metadata={
+                "document_id": document_id,
+                "document_type": document.document_type.value,
+                "title": document.title,
+                "user_id": user_id,
+            },
+        )
+
         try:
-            # Get document
-            result = await session.execute(
-                select(Document)
-                .options(selectinload(Document.chunks))  # Eagerly load chunks
-                .where(Document.id == document_id)
-            )
-            document = result.scalars().first()
+            # Read markdown directly from source_markdown
+            markdown_content = document.source_markdown
 
-            if not document:
-                logger.error(f"Document {document_id} not found")
-                return
-
-            if not document.blocknote_document:
-                logger.warning(f"Document {document_id} has no BlockNote content")
+            if not markdown_content:
+                await task_logger.log_task_failure(
+                    log_entry,
+                    f"Document {document_id} has no source_markdown to reindex",
+                    "No source_markdown content",
+                    {"error_type": "NoSourceMarkdown"},
+                )
                 return
 
             logger.info(f"Reindexing document {document_id} ({document.title})")
 
-            # 1. Convert BlockNote → Markdown
-            markdown_content = await convert_blocknote_to_markdown(
-                document.blocknote_document
-            )
-
-            if not markdown_content:
-                logger.error(f"Failed to convert document {document_id} to markdown")
-                return
-
-            # 2. Delete old chunks explicitly
+            # 1. Delete old chunks explicitly
             from app.db import Chunk
 
             await session.execute(delete(Chunk).where(Chunk.document_id == document_id))
             await session.flush()  # Ensure old chunks are deleted
 
-            # 3. Create new chunks
+            # 2. Create new chunks from source_markdown
             new_chunks = await create_document_chunks(markdown_content)
 
-            # 4. Add new chunks to session
+            # 3. Add new chunks to session
             for chunk in new_chunks:
                 chunk.document_id = document_id
                 session.add(chunk)
 
             logger.info(f"Created {len(new_chunks)} chunks for document {document_id}")
 
-            # 5. Regenerate summary
+            # 4. Regenerate summary
             user_llm = await get_user_long_context_llm(
                 session, user_id, document.search_space_id
             )
@@ -111,16 +115,46 @@ async def _reindex_document(document_id: int, user_id: str):
                 markdown_content, user_llm, document_metadata
             )
 
-            # 6. Update document
+            # 5. Update document
             document.content = summary_content
             document.embedding = summary_embedding
             document.content_needs_reindexing = False
 
             await session.commit()
 
+            # Log success
+            await task_logger.log_task_success(
+                log_entry,
+                f"Successfully reindexed document: {document.title}",
+                {
+                    "chunks_created": len(new_chunks),
+                    "document_id": document_id,
+                },
+            )
+
             logger.info(f"Successfully reindexed document {document_id}")
+
+        except SQLAlchemyError as db_error:
+            await session.rollback()
+            await task_logger.log_task_failure(
+                log_entry,
+                f"Database error during reindex for document {document_id}",
+                str(db_error),
+                {"error_type": "SQLAlchemyError"},
+            )
+            logger.error(
+                f"Database error reindexing document {document_id}: {db_error}",
+                exc_info=True,
+            )
+            raise
 
         except Exception as e:
             await session.rollback()
+            await task_logger.log_task_failure(
+                log_entry,
+                f"Failed to reindex document: {document.title}",
+                str(e),
+                {"error_type": type(e).__name__},
+            )
             logger.error(f"Error reindexing document {document_id}: {e}", exc_info=True)
             raise

@@ -1,13 +1,14 @@
 "use client";
 
-import { Loader2 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { Suspense, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Logo } from "@/components/Logo";
+import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
 import { getAuthErrorDetails, shouldRetry } from "@/lib/auth-errors";
+import { AUTH_TYPE } from "@/lib/env-config";
 import { AmbientBackground } from "./AmbientBackground";
 import { GoogleLoginButton } from "./GoogleLoginButton";
 import { LocalLoginForm } from "./LocalLoginForm";
@@ -26,6 +27,13 @@ function LoginContent() {
 		const error = searchParams.get("error");
 		const message = searchParams.get("message");
 		const logout = searchParams.get("logout");
+		const returnUrl = searchParams.get("returnUrl");
+
+		// Save returnUrl to localStorage so it persists through OAuth flows (e.g., Google)
+		// This is read by TokenHandler after successful authentication
+		if (returnUrl) {
+			localStorage.setItem("surfsense_redirect_path", decodeURIComponent(returnUrl));
+		}
 
 		// Show registration success message
 		if (registered === "true") {
@@ -58,7 +66,11 @@ function LoginContent() {
 			});
 
 			// Show toast with conditional retry action
-			const toastOptions: any = {
+			const toastOptions: {
+				description: string;
+				duration: number;
+				action?: { label: string; onClick: () => void };
+			} = {
 				description: errorDescription,
 				duration: 6000,
 			};
@@ -82,25 +94,17 @@ function LoginContent() {
 			});
 		}
 
-		// Get the auth type from environment variables
-		setAuthType(process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "GOOGLE");
+		// Get the auth type from centralized config
+		setAuthType(AUTH_TYPE);
 		setIsLoading(false);
-	}, [searchParams]);
+	}, [searchParams, t, tCommon]);
 
-	// Show loading state while determining auth type
+	// Use global loading screen for auth type determination - spinner animation won't reset
+	useGlobalLoadingEffect(isLoading);
+
+	// Show nothing while loading - the GlobalLoadingProvider handles the loading UI
 	if (isLoading) {
-		return (
-			<div className="relative w-full overflow-hidden">
-				<AmbientBackground />
-				<div className="mx-auto flex h-screen max-w-lg flex-col items-center justify-center">
-					<Logo className="rounded-md" />
-					<div className="mt-8 flex items-center space-x-2">
-						<Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-						<span className="text-muted-foreground">{tCommon("loading")}</span>
-					</div>
-				</div>
-			</div>
-		);
+		return null;
 	}
 
 	if (authType === "GOOGLE") {
@@ -111,8 +115,8 @@ function LoginContent() {
 		<div className="relative w-full overflow-hidden">
 			<AmbientBackground />
 			<div className="mx-auto flex h-screen max-w-lg flex-col items-center justify-center">
-				<Logo className="rounded-md" />
-				<h1 className="my-8 text-xl font-bold text-neutral-800 dark:text-neutral-100 md:text-4xl">
+				<Logo className="h-16 w-16 md:h-32 md:w-32 rounded-md transition-all" />
+				<h1 className="mt-4 mb-6 text-xl font-bold text-neutral-800 dark:text-neutral-100 md:mt-8 md:mb-8 md:text-3xl lg:text-4xl transition-all">
 					{t("sign_in")}
 				</h1>
 
@@ -181,23 +185,10 @@ function LoginContent() {
 	);
 }
 
-// Loading fallback for Suspense
-const LoadingFallback = () => (
-	<div className="relative w-full overflow-hidden">
-		<AmbientBackground />
-		<div className="mx-auto flex h-screen max-w-lg flex-col items-center justify-center">
-			<Logo className="rounded-md" />
-			<div className="mt-8 flex items-center space-x-2">
-				<Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-				<span className="text-muted-foreground">Loading...</span>
-			</div>
-		</div>
-	</div>
-);
-
 export default function LoginPage() {
+	// Suspense fallback returns null - the GlobalLoadingProvider handles the loading UI
 	return (
-		<Suspense fallback={<LoadingFallback />}>
+		<Suspense fallback={null}>
 			<LoginContent />
 		</Suspense>
 	);

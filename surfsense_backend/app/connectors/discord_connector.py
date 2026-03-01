@@ -3,7 +3,7 @@ Discord Connector
 
 A module for interacting with Discord's HTTP API to retrieve guilds, channels, and message history.
 
-Requires a Discord bot token.
+Supports both direct bot token and OAuth-based authentication with token refresh.
 """
 
 import asyncio
@@ -12,6 +12,14 @@ import logging
 
 import discord
 from discord.ext import commands
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+from app.config import config
+from app.db import SearchSourceConnector
+from app.routes.discord_add_connector_route import refresh_discord_token
+from app.schemas.discord_auth_credentials import DiscordAuthCredentialsBase
+from app.utils.oauth_security import TokenEncryption
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +27,21 @@ logger = logging.getLogger(__name__)
 class DiscordConnector(commands.Bot):
     """Class for retrieving guild, channel, and message history from Discord."""
 
-    def __init__(self, token: str | None = None):
+    def __init__(
+        self,
+        token: str | None = None,
+        session: AsyncSession | None = None,
+        connector_id: int | None = None,
+        credentials: DiscordAuthCredentialsBase | None = None,
+    ):
         """
-        Initialize the DiscordConnector with a bot token.
+        Initialize the DiscordConnector with a bot token or OAuth credentials.
 
         Args:
-            token (str): The Discord bot token.
+            token: Discord bot token (optional, for backward compatibility)
+            session: Database session for token refresh (optional)
+            connector_id: Connector ID for token refresh (optional)
+            credentials: Discord OAuth credentials (optional, will be loaded from DB if not provided)
         """
         intents = discord.Intents.default()
         intents.guilds = True  # Required to fetch guilds and channels
@@ -34,9 +51,19 @@ class DiscordConnector(commands.Bot):
         super().__init__(
             command_prefix="!", intents=intents
         )  # command_prefix is required but not strictly used here
-        self.token = token
+        self._session = session
+        self._connector_id = connector_id
+        self._credentials = credentials
+        # For backward compatibility, if token is provided directly, use it
+        if token:
+            self.token = token
+        else:
+            self.token = None
         self._bot_task = None  # Holds the async bot task
         self._is_running = False  # Flag to track if the bot is running
+        self._start_called_event = (
+            asyncio.Event()
+        )  # Event to signal when start() is called
 
         # Event to confirm bot is ready
         @self.event
@@ -57,12 +84,143 @@ class DiscordConnector(commands.Bot):
         async def on_resumed():
             logger.debug("Bot resumed connection to Discord gateway.")
 
+    async def _get_valid_token(self) -> str:
+        """
+        Get valid Discord bot token, refreshing if needed.
+
+        Returns:
+            Valid bot token
+
+        Raises:
+            ValueError: If credentials are missing or invalid
+            Exception: If token refresh fails
+        """
+        # If we have a direct token (backward compatibility), use it
+        if (
+            self.token
+            and self._session is None
+            and self._connector_id is None
+            and self._credentials is None
+        ):
+            # This means it was initialized with a direct token, use it
+            return self.token
+
+        # Load credentials from DB if not provided
+        if self._credentials is None:
+            if not self._session or not self._connector_id:
+                raise ValueError(
+                    "Cannot load credentials: session and connector_id required"
+                )
+
+            result = await self._session.execute(
+                select(SearchSourceConnector).filter(
+                    SearchSourceConnector.id == self._connector_id
+                )
+            )
+            connector = result.scalars().first()
+
+            if not connector:
+                raise ValueError(f"Connector {self._connector_id} not found")
+
+            config_data = connector.config.copy()
+
+            # Decrypt credentials if they are encrypted
+            token_encrypted = config_data.get("_token_encrypted", False)
+            if token_encrypted and config.SECRET_KEY:
+                try:
+                    token_encryption = TokenEncryption(config.SECRET_KEY)
+
+                    # Decrypt sensitive fields
+                    if config_data.get("bot_token"):
+                        config_data["bot_token"] = token_encryption.decrypt_token(
+                            config_data["bot_token"]
+                        )
+                    if config_data.get("refresh_token"):
+                        config_data["refresh_token"] = token_encryption.decrypt_token(
+                            config_data["refresh_token"]
+                        )
+
+                    logger.info(
+                        f"Decrypted Discord credentials for connector {self._connector_id}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to decrypt Discord credentials for connector {self._connector_id}: {e!s}"
+                    )
+                    raise ValueError(
+                        f"Failed to decrypt Discord credentials: {e!s}"
+                    ) from e
+
+            try:
+                self._credentials = DiscordAuthCredentialsBase.from_dict(config_data)
+            except Exception as e:
+                raise ValueError(f"Invalid Discord credentials: {e!s}") from e
+
+        # Check if token is expired and refreshable
+        if self._credentials.is_expired and self._credentials.is_refreshable:
+            try:
+                logger.info(
+                    f"Discord token expired for connector {self._connector_id}, refreshing..."
+                )
+
+                # Get connector for refresh
+                result = await self._session.execute(
+                    select(SearchSourceConnector).filter(
+                        SearchSourceConnector.id == self._connector_id
+                    )
+                )
+                connector = result.scalars().first()
+
+                if not connector:
+                    raise RuntimeError(
+                        f"Connector {self._connector_id} not found; cannot refresh token."
+                    )
+
+                # Refresh token
+                connector = await refresh_discord_token(self._session, connector)
+
+                # Reload credentials after refresh
+                config_data = connector.config.copy()
+                token_encrypted = config_data.get("_token_encrypted", False)
+                if token_encrypted and config.SECRET_KEY:
+                    token_encryption = TokenEncryption(config.SECRET_KEY)
+                    if config_data.get("bot_token"):
+                        config_data["bot_token"] = token_encryption.decrypt_token(
+                            config_data["bot_token"]
+                        )
+                    if config_data.get("refresh_token"):
+                        config_data["refresh_token"] = token_encryption.decrypt_token(
+                            config_data["refresh_token"]
+                        )
+
+                self._credentials = DiscordAuthCredentialsBase.from_dict(config_data)
+
+                logger.info(
+                    f"Successfully refreshed Discord token for connector {self._connector_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to refresh Discord token for connector {self._connector_id}: {e!s}"
+                )
+                raise Exception(
+                    f"Failed to refresh Discord OAuth credentials: {e!s}"
+                ) from e
+
+        return self._credentials.bot_token
+
     async def start_bot(self):
         """Starts the bot to connect to Discord."""
         logger.info("Starting Discord bot...")
 
+        # Get valid token (with auto-refresh if using OAuth)
         if not self.token:
-            raise ValueError("Discord bot token not set. Call set_token(token) first.")
+            # Try to get token from credentials
+            try:
+                self.token = await self._get_valid_token()
+            except ValueError as e:
+                raise ValueError(
+                    f"Discord bot token not set. {e!s} Please authenticate via OAuth or provide a token."
+                ) from e
 
         try:
             if self._is_running:
@@ -70,6 +228,9 @@ class DiscordConnector(commands.Bot):
                     "Bot is already running. Use close_bot() to stop it before starting again."
                 )
                 return
+
+            # Signal that we're about to call start() - this allows _wait_until_ready() to proceed
+            self._start_called_event.set()
 
             await self.start(self.token)
             logger.info("Discord bot started successfully.")
@@ -105,9 +266,12 @@ class DiscordConnector(commands.Bot):
         else:
             logger.info("Bot is not running or already disconnected.")
 
+        # Reset the start event so the connector can be reused
+        self._start_called_event.clear()
+
     def set_token(self, token: str) -> None:
         """
-        Set the discord bot token.
+        Set the discord bot token (for backward compatibility).
 
         Args:
             token (str): The Discord bot token.
@@ -122,10 +286,16 @@ class DiscordConnector(commands.Bot):
         """Helper to wait until the bot is connected and ready."""
         logger.info("Waiting for the bot to be ready...")
 
-        # Give the event loop a chance to switch to the bot's startup task.
-        # This allows self.start() to begin initializing the client.
-        # Terrible solution, but necessary to avoid blocking the event loop.
-        await asyncio.sleep(1)  # Yield control to the event loop
+        # Wait for start_bot() to actually call self.start()
+        # This ensures we don't call wait_until_ready() before the client is initialized
+        try:
+            await asyncio.wait_for(self._start_called_event.wait(), timeout=30.0)
+            logger.info("Bot start() has been called, now waiting for ready state...")
+        except TimeoutError:
+            logger.error("start_bot() did not call start() within 30 seconds")
+            raise RuntimeError(
+                "Discord client failed to initialize - start() was never called"
+            ) from None
 
         try:
             await asyncio.wait_for(self.wait_until_ready(), timeout=60.0)

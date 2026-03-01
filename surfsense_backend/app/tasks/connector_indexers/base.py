@@ -3,7 +3,7 @@ Base functionality and shared imports for connector indexers.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -16,6 +16,85 @@ from app.db import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+
+def get_current_timestamp() -> datetime:
+    """
+    Get the current timestamp with timezone for updated_at field.
+
+    Returns:
+        Current datetime with UTC timezone
+    """
+    return datetime.now(UTC)
+
+
+def safe_set_chunks(document: Document, chunks: list) -> None:
+    """
+    Safely assign chunks to a document without triggering lazy loading.
+
+    ALWAYS use this instead of `document.chunks = chunks` to avoid
+    SQLAlchemy async errors (MissingGreenlet / greenlet_spawn).
+
+    Why this is needed:
+    - Direct assignment `document.chunks = chunks` triggers SQLAlchemy to
+      load the OLD chunks first (for comparison/orphan detection)
+    - This lazy loading fails in async context with asyncpg driver
+    - set_committed_value bypasses this by setting the value directly
+
+    This function is safe regardless of how the document was loaded
+    (with or without selectinload).
+
+    Args:
+        document: The Document object to update
+        chunks: List of Chunk objects to assign
+
+    Example:
+        # Instead of: document.chunks = chunks (DANGEROUS!)
+        safe_set_chunks(document, chunks)  # Always safe
+    """
+    from sqlalchemy.orm import object_session
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    # Keep relationship assignment lazy-load-safe.
+    set_committed_value(document, "chunks", chunks)
+
+    # Ensure chunk rows are actually persisted.
+    # set_committed_value bypasses normal unit-of-work tracking, so we need to
+    # explicitly attach chunk objects to the current session.
+    session = object_session(document)
+    if session is not None:
+        if document.id is not None:
+            for chunk in chunks:
+                chunk.document_id = document.id
+        session.add_all(chunks)
+
+
+def parse_date_flexible(date_str: str) -> datetime:
+    """
+    Parse date from multiple common formats.
+
+    Args:
+        date_str: Date string to parse
+
+    Returns:
+        Parsed datetime object
+
+    Raises:
+        ValueError: If unable to parse the date string
+    """
+    formats = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str.rstrip("Z"), fmt)
+        except ValueError:
+            continue
+
+    # Try ISO format as fallback
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError as err:
+        raise ValueError(f"Unable to parse date: {date_str}") from err
 
 
 async def check_duplicate_document_by_hash(
@@ -102,6 +181,13 @@ def calculate_date_range(
     Returns:
         Tuple of (start_date_str, end_date_str)
     """
+    # Normalize "undefined" strings to None (from frontend)
+    # This prevents parsing errors and ensures consistent behavior across all indexers
+    if start_date == "undefined" or start_date == "":
+        start_date = None
+    if end_date == "undefined" or end_date == "":
+        end_date = None
+
     if start_date is not None and end_date is not None:
         return start_date, end_date
 
@@ -141,6 +227,26 @@ def calculate_date_range(
         start_date if start_date else calculated_start_date.strftime("%Y-%m-%d")
     )
     end_date_str = end_date if end_date else calculated_end_date.strftime("%Y-%m-%d")
+
+    # FIX: Ensure end_date is at least 1 day after start_date to avoid
+    # "start_date must be strictly before end_date" errors when dates are the same
+    # (e.g., when last_indexed_at is today)
+    if start_date_str == end_date_str:
+        logger.info(
+            f"Start date ({start_date_str}) equals end date ({end_date_str}), "
+            "adjusting end date to next day to ensure valid date range"
+        )
+        # Parse end_date and add 1 day
+        try:
+            end_dt = parse_date_flexible(end_date_str)
+        except ValueError:
+            logger.warning(
+                f"Could not parse end_date '{end_date_str}', using current date"
+            )
+            end_dt = datetime.now()
+        end_dt = end_dt + timedelta(days=1)
+        end_date_str = end_dt.strftime("%Y-%m-%d")
+        logger.info(f"Adjusted end date to {end_date_str}")
 
     return start_date_str, end_date_str
 

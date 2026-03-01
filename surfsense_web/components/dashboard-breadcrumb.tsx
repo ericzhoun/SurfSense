@@ -1,10 +1,9 @@
 "use client";
 
-import { useAtomValue } from "jotai";
+import { useQuery } from "@tanstack/react-query";
 import { usePathname } from "next/navigation";
 import { useTranslations } from "next-intl";
 import React, { useEffect, useState } from "react";
-import { activeChatAtom } from "@/atoms/chats/chat-query.atoms";
 import {
 	Breadcrumb,
 	BreadcrumbItem,
@@ -13,8 +12,10 @@ import {
 	BreadcrumbPage,
 	BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
-import { useSearchSpace } from "@/hooks/use-search-space";
+import { searchSpacesApiService } from "@/lib/apis/search-spaces-api.service";
 import { authenticatedFetch, getBearerToken } from "@/lib/auth-utils";
+import { getThreadFull } from "@/lib/chat/thread-persistence";
+import { cacheKeys } from "@/lib/query-client/cache-keys";
 
 interface BreadcrumbItemInterface {
 	label: string;
@@ -24,15 +25,24 @@ interface BreadcrumbItemInterface {
 export function DashboardBreadcrumb() {
 	const t = useTranslations("breadcrumb");
 	const pathname = usePathname();
-	const { data: activeChatState } = useAtomValue(activeChatAtom);
 	// Extract search space ID and chat ID from pathname
 	const segments = pathname.split("/").filter(Boolean);
 	const searchSpaceId = segments[0] === "dashboard" && segments[1] ? segments[1] : null;
 
-	// Fetch search space details if we have an ID
-	const { searchSpace } = useSearchSpace({
-		searchSpaceId: searchSpaceId || "",
-		autoFetch: !!searchSpaceId,
+	const { data: searchSpace } = useQuery({
+		queryKey: cacheKeys.searchSpaces.detail(searchSpaceId || ""),
+		queryFn: () => searchSpacesApiService.getSearchSpace({ id: Number(searchSpaceId) }),
+		enabled: !!searchSpaceId,
+	});
+
+	// Extract chat thread ID from pathname for chat pages
+	const chatThreadId = segments[2] === "new-chat" && segments[3] ? segments[3] : null;
+
+	// Fetch thread details when on a chat page with a thread ID
+	const { data: threadData } = useQuery({
+		queryKey: ["threads", searchSpaceId, "detail", chatThreadId],
+		queryFn: () => getThreadFull(Number(chatThreadId)),
+		enabled: !!chatThreadId && !!searchSpaceId,
 	});
 
 	// State to store document title for editor breadcrumb
@@ -42,6 +52,13 @@ export function DashboardBreadcrumb() {
 	useEffect(() => {
 		if (segments[2] === "editor" && segments[3] && searchSpaceId) {
 			const documentId = segments[3];
+
+			// Skip fetch for "new" notes
+			if (documentId === "new") {
+				setDocumentTitle(null);
+				return;
+			}
+
 			const token = getBearerToken();
 
 			if (token) {
@@ -70,10 +87,7 @@ export function DashboardBreadcrumb() {
 		const segments = path.split("/").filter(Boolean);
 		const breadcrumbs: BreadcrumbItemInterface[] = [];
 
-		// Always start with Dashboard
-		breadcrumbs.push({ label: t("dashboard"), href: "/dashboard" });
-
-		// Handle search space
+		// Handle search space (start directly with search space, skip "Dashboard")
 		if (segments[0] === "dashboard" && segments[1]) {
 			// Use the actual search space name if available, otherwise fall back to the ID
 			const searchSpaceLabel = searchSpace?.name || `${t("search_space")} ${segments[1]}`;
@@ -89,13 +103,9 @@ export function DashboardBreadcrumb() {
 
 				// Map section names to more readable labels
 				const sectionLabels: Record<string, string> = {
-					researcher: t("researcher"),
+					"new-chat": t("chat") || "Chat",
 					documents: t("documents"),
-					connectors: t("connectors"),
-					sources: "Sources",
-					podcasts: t("podcasts"),
 					logs: t("logs"),
-					chats: t("chats"),
 					settings: t("settings"),
 					editor: t("editor"),
 				};
@@ -108,7 +118,14 @@ export function DashboardBreadcrumb() {
 
 					// Handle editor sub-sections (document ID)
 					if (section === "editor") {
-						const documentLabel = documentTitle || subSection;
+						// Handle special cases for editor
+						let documentLabel: string;
+						if (subSection === "new") {
+							documentLabel = "New Note";
+						} else {
+							documentLabel = documentTitle || subSection;
+						}
+
 						breadcrumbs.push({
 							label: t("documents"),
 							href: `/dashboard/${segments[1]}/documents`,
@@ -121,26 +138,10 @@ export function DashboardBreadcrumb() {
 						return breadcrumbs;
 					}
 
-					// Handle sources sub-sections
-					if (section === "sources") {
-						const sourceLabels: Record<string, string> = {
-							add: "Add Sources",
-						};
-
-						const sourceLabel = sourceLabels[subSection] || subSection;
-						breadcrumbs.push({
-							label: "Sources",
-							href: `/dashboard/${segments[1]}/sources`,
-						});
-						breadcrumbs.push({ label: sourceLabel });
-						return breadcrumbs;
-					}
-
 					// Handle documents sub-sections
 					if (section === "documents") {
 						const documentLabels: Record<string, string> = {
 							upload: t("upload_documents"),
-							youtube: t("add_youtube"),
 							webpage: t("add_webpages"),
 						};
 
@@ -153,65 +154,13 @@ export function DashboardBreadcrumb() {
 						return breadcrumbs;
 					}
 
-					// Handle researcher sub-sections (chat IDs)
-					if (section === "researcher") {
-						// Use the actual chat title if available, otherwise fall back to the ID
-						const chatLabel = activeChatState?.chatDetails?.title || subSection;
+					// Handle new-chat sub-sections (thread IDs)
+					// Show the chat title if available, otherwise fall back to "Chat"
+					if (section === "new-chat") {
+						const chatLabel = threadData?.title || t("chat") || "Chat";
 						breadcrumbs.push({
-							label: t("researcher"),
-							href: `/dashboard/${segments[1]}/researcher`,
+							label: chatLabel,
 						});
-						breadcrumbs.push({ label: chatLabel });
-						return breadcrumbs;
-					}
-
-					// Handle connector sub-sections
-					if (section === "connectors") {
-						// Handle specific connector types
-						if (subSection === "add" && segments[4]) {
-							const connectorType = segments[4];
-							const connectorLabels: Record<string, string> = {
-								"github-connector": "GitHub",
-								"jira-connector": "Jira",
-								"confluence-connector": "Confluence",
-								"bookstack-connector": "BookStack",
-								"discord-connector": "Discord",
-								"linear-connector": "Linear",
-								"clickup-connector": "ClickUp",
-								"slack-connector": "Slack",
-								"notion-connector": "Notion",
-								"tavily-api": "Tavily API",
-								"serper-api": "Serper API",
-								"linkup-api": "LinkUp API",
-								"luma-connector": "Luma",
-								"elasticsearch-connector": "Elasticsearch",
-								"webcrawler-connector": "Web Pages",
-							};
-
-							const connectorLabel = connectorLabels[connectorType] || connectorType;
-							breadcrumbs.push({
-								label: "Connectors",
-								href: `/dashboard/${segments[1]}/connectors`,
-							});
-							breadcrumbs.push({
-								label: "Add Connector",
-								href: `/dashboard/${segments[1]}/connectors/add`,
-							});
-							breadcrumbs.push({ label: connectorLabel });
-							return breadcrumbs;
-						}
-
-						const connectorLabels: Record<string, string> = {
-							add: t("add_connector"),
-							manage: t("manage_connectors"),
-						};
-
-						const connectorLabel = connectorLabels[subSection] || subSection;
-						breadcrumbs.push({
-							label: t("connectors"),
-							href: `/dashboard/${segments[1]}/connectors`,
-						});
-						breadcrumbs.push({ label: connectorLabel });
 						return breadcrumbs;
 					}
 
@@ -221,8 +170,6 @@ export function DashboardBreadcrumb() {
 						upload: t("upload_documents"),
 						youtube: t("add_youtube"),
 						webpage: t("add_webpages"),
-						add: t("add_connector"),
-						edit: t("edit_connector"),
 						manage: t("manage"),
 					};
 
@@ -244,15 +191,15 @@ export function DashboardBreadcrumb() {
 
 	const breadcrumbs = generateBreadcrumbs(pathname);
 
-	if (breadcrumbs.length <= 1) {
+	if (breadcrumbs.length === 0) {
 		return null; // Don't show breadcrumbs for root dashboard
 	}
 
 	return (
-		<Breadcrumb>
+		<Breadcrumb className="select-none">
 			<BreadcrumbList>
 				{breadcrumbs.map((item, index) => (
-					<React.Fragment key={index}>
+					<React.Fragment key={`${index}-${item.href || item.label}`}>
 						<BreadcrumbItem>
 							{index === breadcrumbs.length - 1 ? (
 								<BreadcrumbPage>{item.label}</BreadcrumbPage>

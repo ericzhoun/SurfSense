@@ -4,25 +4,38 @@ import { Pricing } from "@/components/pricing";
 
 const demoPlans = [
 	{
-		name: "COMMUNITY",
+		name: "FREE",
 		price: "0",
 		yearlyPrice: "0",
-		period: "forever",
+		period: "",
+		billingText: "",
 		features: [
-			"Supports 100+ LLMs",
-			"Supports local Ollama or vLLM setups",
-			"6000+ Embedding Models",
-			"50+ File extensions supported.",
-			"Podcasts support with local TTS providers.",
-			"Connects with 15+ external sources.",
-			"Cross-Browser Extension for dynamic webpages including authenticated content",
-			"Role-based access permissions",
-			"Collaboration and multiplayer features",
-			"Upcoming: Note Management",
+			"Self Hostable",
+			"Upload and chat with 300+ pages of content",
+			"Includes access to ChatGPT text and audio models",
+			"Realtime Collaborative Group Chats with teammates",
+			"Community support on Discord",
 		],
-		description: "Open source version with powerful features",
+		description: "",
 		buttonText: "Get Started",
-		href: "/docs",
+		href: "/login",
+		isPopular: false,
+	},
+	{
+		name: "PRO",
+		price: "0",
+		yearlyPrice: "0",
+		period: "",
+		billingText: "Free during beta",
+		features: [
+			"Everything in Free",
+			"Includes 6000+ pages of content",
+			"Access to more models and providers",
+			"Priority support on Discord",
+		],
+		description: "",
+		buttonText: "Get Started",
+		href: "/login",
 		isPopular: true,
 	},
 	{
@@ -30,15 +43,18 @@ const demoPlans = [
 		price: "Contact Us",
 		yearlyPrice: "Contact Us",
 		period: "",
+		billingText: "",
 		features: [
-			"Everything in Community",
-			"Priority Support",
-			"Advanced security features",
+			"Everything in Pro",
+			"On-prem or VPC deployment",
 			"Audit logs and compliance",
 			"SSO, OIDC & SAML",
-			"SLA guarantee",
+			"White-glove setup and deployment",
+			"Monthly managed updates and maintenance",
+			"SLA commitments",
+			"Dedicated support",
 		],
-		description: "For large organizations with specific needs",
+		description: "Customized setup for large organizations",
 		buttonText: "Contact Sales",
 		href: "/contact",
 		isPopular: false,
@@ -47,7 +63,7 @@ const demoPlans = [
 
 function PricingBasic() {
 	return (
-		<Pricing plans={demoPlans} title="SurfSense Pricing" description="Choose that works for you" />
+		<Pricing plans={demoPlans} title="SurfSense Pricing" description="Choose what works for you" />
 	);
 }
 

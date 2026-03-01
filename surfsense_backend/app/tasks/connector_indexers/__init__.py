@@ -26,6 +26,8 @@ Available indexers:
 # Calendar and scheduling
 from .airtable_indexer import index_airtable_records
 from .bookstack_indexer import index_bookstack_pages
+
+# Note: composio_indexer is imported directly in connector_tasks.py to avoid circular imports
 from .clickup_indexer import index_clickup_tasks
 from .confluence_indexer import index_confluence_pages
 from .discord_indexer import index_discord_messages
@@ -34,6 +36,7 @@ from .discord_indexer import index_discord_messages
 from .elasticsearch_indexer import index_elasticsearch_documents
 from .github_indexer import index_github_repos
 from .google_calendar_indexer import index_google_calendar_events
+from .google_drive_indexer import index_google_drive_files
 from .google_gmail_indexer import index_google_gmail_messages
 from .jira_indexer import index_jira_issues
 
@@ -43,12 +46,14 @@ from .luma_indexer import index_luma_events
 
 # Documentation and knowledge management
 from .notion_indexer import index_notion_pages
+from .obsidian_indexer import index_obsidian_vault
 from .slack_indexer import index_slack_messages
 from .webcrawler_indexer import index_crawled_urls
 
 __all__ = [  # noqa: RUF022
     "index_airtable_records",
     "index_bookstack_pages",
+    # "index_composio_connector",  # Imported directly in connector_tasks.py to avoid circular imports
     "index_clickup_tasks",
     "index_confluence_pages",
     "index_discord_messages",
@@ -57,12 +62,14 @@ __all__ = [  # noqa: RUF022
     "index_github_repos",
     # Calendar and scheduling
     "index_google_calendar_events",
+    "index_google_drive_files",
     "index_luma_events",
     "index_jira_issues",
     # Issue tracking and project management
     "index_linear_issues",
     # Documentation and knowledge management
     "index_notion_pages",
+    "index_obsidian_vault",
     "index_crawled_urls",
     # Communication platforms
     "index_slack_messages",

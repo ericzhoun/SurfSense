@@ -1,8 +1,14 @@
 import argparse
+import asyncio
 import logging
+import sys
 
 import uvicorn
 from dotenv import load_dotenv
+
+# Fix for Windows: psycopg requires SelectorEventLoop, not ProactorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from app.config.uvicorn import load_uvicorn_config
 
@@ -23,4 +29,7 @@ if __name__ == "__main__":
     config = uvicorn.Config(**config_kwargs)
     server = uvicorn.Server(config)
 
-    server.run()
+    if sys.platform == "win32":
+        asyncio.run(server.serve(), loop_factory=asyncio.SelectorEventLoop)
+    else:
+        server.run()

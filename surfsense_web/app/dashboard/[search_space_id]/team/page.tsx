@@ -1,49 +1,39 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
+import { useAtomValue } from "jotai";
 import {
-	type ColumnDef,
-	type ColumnFiltersState,
-	flexRender,
-	getCoreRowModel,
-	getFilteredRowModel,
-	getPaginationRowModel,
-	getSortedRowModel,
-	type SortingState,
-	useReactTable,
-} from "@tanstack/react-table";
-import {
-	ArrowLeft,
 	Calendar,
 	Check,
 	ChevronDown,
-	ChevronUp,
+	ChevronFirst,
+	ChevronLast,
+	ChevronLeft,
+	ChevronRight,
 	Clock,
 	Copy,
-	Crown,
-	Edit2,
-	ExternalLink,
 	Hash,
 	Link2,
-	LinkIcon,
-	Loader2,
-	MoreHorizontal,
-	Plus,
-	RefreshCw,
-	Search,
-	Settings,
-	Shield,
-	ShieldCheck,
+	ShieldUser,
 	Trash2,
 	User,
-	UserMinus,
 	UserPlus,
 	Users,
-	X,
 } from "lucide-react";
 import { motion } from "motion/react";
+import Image from "next/image";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
+import {
+	createInviteMutationAtom,
+	deleteInviteMutationAtom,
+} from "@/atoms/invites/invites-mutation.atoms";
+import {
+	deleteMemberMutationAtom,
+	updateMemberMutationAtom,
+} from "@/atoms/members/members-mutation.atoms";
+import { membersAtom, myAccessAtom } from "@/atoms/members/members-query.atoms";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -55,11 +45,8 @@ import {
 	AlertDialogTitle,
 	AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Calendar as CalendarComponent } from "@/components/ui/calendar";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
 	Dialog,
 	DialogContent,
@@ -73,14 +60,12 @@ import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
-	DropdownMenuLabel,
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
 	Select,
 	SelectContent,
@@ -88,7 +73,8 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import {
 	Table,
 	TableBody,
@@ -97,844 +83,545 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import {
-	type Invite,
-	type InviteCreate,
-	type Member,
-	type Role,
-	type RoleCreate,
-	useInvites,
-	useMembers,
-	usePermissions,
-	useRoles,
-	useUserAccess,
-} from "@/hooks/use-rbac";
+import type {
+	CreateInviteRequest,
+	DeleteInviteRequest,
+	Invite,
+} from "@/contracts/types/invites.types";
+import type {
+	DeleteMembershipRequest,
+	Membership,
+	UpdateMembershipRequest,
+} from "@/contracts/types/members.types";
+import type { Role } from "@/contracts/types/roles.types";
+import { invitesApiService } from "@/lib/apis/invites-api.service";
+import { rolesApiService } from "@/lib/apis/roles-api.service";
+import { formatRelativeDate } from "@/lib/format-date";
+import { trackSearchSpaceInviteSent, trackSearchSpaceUsersViewed } from "@/lib/posthog/events";
+import { cacheKeys } from "@/lib/query-client/cache-keys";
 import { cn } from "@/lib/utils";
 
-// Animation variants
-const fadeInUp = {
-	hidden: { opacity: 0, y: 20 },
-	visible: { opacity: 1, y: 0, transition: { duration: 0.4, ease: "easeOut" } },
-};
+const AVATAR_COLORS = [
+	"bg-amber-600",
+	"bg-blue-600",
+	"bg-emerald-600",
+	"bg-violet-600",
+	"bg-rose-600",
+	"bg-cyan-600",
+	"bg-orange-600",
+	"bg-teal-600",
+	"bg-pink-600",
+	"bg-indigo-600",
+];
 
-const staggerContainer = {
-	hidden: { opacity: 0 },
-	visible: {
-		opacity: 1,
-		transition: { staggerChildren: 0.1 },
-	},
-};
+function getAvatarColor(identifier: string): string {
+	let hash = 0;
+	for (let i = 0; i < identifier.length; i++) {
+		hash = identifier.charCodeAt(i) + ((hash << 5) - hash);
+	}
+	return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
 
-const cardVariants = {
-	hidden: { opacity: 0, scale: 0.95 },
-	visible: {
-		opacity: 1,
-		scale: 1,
-		transition: { type: "spring", stiffness: 300, damping: 30 },
-	},
-};
+function getAvatarInitials(member: Membership): string {
+	if (member.user_display_name) {
+		const parts = member.user_display_name.trim().split(/\s+/);
+		if (parts.length >= 2) {
+			return (parts[0][0] + parts[1][0]).toUpperCase();
+		}
+		return member.user_display_name.slice(0, 2).toUpperCase();
+	}
+	if (member.user_email) {
+		const emailName = member.user_email.split("@")[0];
+		return emailName.slice(0, 2).toUpperCase();
+	}
+	return "U";
+}
+
+const PAGE_SIZE = 5;
 
 export default function TeamManagementPage() {
-	const router = useRouter();
 	const params = useParams();
 	const searchSpaceId = Number(params.search_space_id);
-	const [activeTab, setActiveTab] = useState("members");
 
-	const { access, loading: accessLoading, hasPermission } = useUserAccess(searchSpaceId);
-	const {
-		members,
-		loading: membersLoading,
-		fetchMembers,
-		updateMemberRole,
-		removeMember,
-	} = useMembers(searchSpaceId);
-	const {
-		roles,
-		loading: rolesLoading,
-		fetchRoles,
-		createRole,
-		updateRole,
-		deleteRole,
-	} = useRoles(searchSpaceId);
-	const {
-		invites,
-		loading: invitesLoading,
-		fetchInvites,
-		createInvite,
-		revokeInvite,
-	} = useInvites(searchSpaceId);
-	const { groupedPermissions, loading: permissionsLoading } = usePermissions();
+	const { data: access = null, isLoading: accessLoading } = useAtomValue(myAccessAtom);
 
-	const canManageMembers = hasPermission("members:view");
-	const canManageRoles = hasPermission("roles:read");
+	const hasPermission = useCallback(
+		(permission: string) => {
+			if (!access) return false;
+			if (access.is_owner) return true;
+			return access.permissions?.includes(permission) ?? false;
+		},
+		[access]
+	);
+
+	const { data: members = [], isLoading: membersLoading } = useAtomValue(membersAtom);
+
+	const { mutateAsync: updateMember } = useAtomValue(updateMemberMutationAtom);
+	const { mutateAsync: deleteMember } = useAtomValue(deleteMemberMutationAtom);
+	const { mutateAsync: createInvite } = useAtomValue(createInviteMutationAtom);
+	const { mutateAsync: revokeInvite } = useAtomValue(deleteInviteMutationAtom);
+
+	const handleRevokeInvite = useCallback(
+		async (inviteId: number): Promise<boolean> => {
+			const request: DeleteInviteRequest = {
+				search_space_id: searchSpaceId,
+				invite_id: inviteId,
+			};
+			await revokeInvite(request);
+			return true;
+		},
+		[revokeInvite, searchSpaceId]
+	);
+
+	const handleCreateInvite = useCallback(
+		async (inviteData: CreateInviteRequest["data"]) => {
+			const request: CreateInviteRequest = {
+				search_space_id: searchSpaceId,
+				data: inviteData,
+			};
+			return await createInvite(request);
+		},
+		[createInvite, searchSpaceId]
+	);
+
+	const handleUpdateMember = useCallback(
+		async (membershipId: number, roleId: number | null): Promise<Membership> => {
+			const request: UpdateMembershipRequest = {
+				search_space_id: searchSpaceId,
+				membership_id: membershipId,
+				data: { role_id: roleId },
+			};
+			return (await updateMember(request)) as Membership;
+		},
+		[updateMember, searchSpaceId]
+	);
+
+	const handleRemoveMember = useCallback(
+		async (membershipId: number) => {
+			const request: DeleteMembershipRequest = {
+				search_space_id: searchSpaceId,
+				membership_id: membershipId,
+			};
+			await deleteMember(request);
+			return true;
+		},
+		[deleteMember, searchSpaceId]
+	);
+
+	const { data: roles = [] } = useQuery({
+		queryKey: cacheKeys.roles.all(searchSpaceId.toString()),
+		queryFn: () => rolesApiService.getRoles({ search_space_id: searchSpaceId }),
+		enabled: !!searchSpaceId,
+	});
+
+	const { data: invites = [] } = useQuery({
+		queryKey: cacheKeys.invites.all(searchSpaceId.toString()),
+		queryFn: () => invitesApiService.getInvites({ search_space_id: searchSpaceId }),
+		staleTime: 5 * 60 * 1000,
+	});
+
+	const activeInvites = useMemo(() => invites.filter((i) => i.is_active), [invites]);
+
 	const canInvite = hasPermission("members:invite");
+	const canManageRoles = hasPermission("members:manage_roles");
+	const canRemove = hasPermission("members:remove");
 
-	const handleRefresh = useCallback(async () => {
-		await Promise.all([fetchMembers(), fetchRoles(), fetchInvites()]);
-		toast.success("Team data refreshed");
-	}, [fetchMembers, fetchRoles, fetchInvites]);
+	const owners = useMemo(() => members.filter((m) => m.is_owner), [members]);
+	const nonOwnerMembers = useMemo(() => members.filter((m) => !m.is_owner), [members]);
 
-	if (accessLoading) {
-		return (
-			<div className="flex items-center justify-center min-h-[60vh]">
-				<motion.div
-					initial={{ opacity: 0, scale: 0.9 }}
-					animate={{ opacity: 1, scale: 1 }}
-					className="flex flex-col items-center gap-4"
-				>
-					<Loader2 className="h-10 w-10 text-primary animate-spin" />
-					<p className="text-muted-foreground">Loading team data...</p>
-				</motion.div>
-			</div>
+	const [pageIndex, setPageIndex] = useState(0);
+	const totalItems = nonOwnerMembers.length;
+	const lastPage = Math.max(0, Math.ceil(totalItems / PAGE_SIZE) - 1);
+
+	useEffect(() => {
+		if (pageIndex > lastPage) setPageIndex(lastPage);
+	}, [pageIndex, lastPage]);
+
+	const paginatedMembers = useMemo(() => {
+		const start = pageIndex * PAGE_SIZE;
+		const end = start + PAGE_SIZE;
+		return nonOwnerMembers.slice(
+			Math.min(start, nonOwnerMembers.length),
+			Math.min(end, nonOwnerMembers.length)
 		);
-	}
+	}, [nonOwnerMembers, pageIndex]);
 
-	return (
-		<motion.div
-			initial="hidden"
-			animate="visible"
-			variants={staggerContainer}
-			className="min-h-screen bg-background"
-		>
-			<div className="container max-w-7xl mx-auto p-6 lg:p-8">
-				<motion.div variants={fadeInUp} className="space-y-8">
-					{/* Header */}
-					<div className="space-y-4">
-						<div className="flex items-center justify-between">
-							<div className="flex items-center space-x-4">
-								<button
-									onClick={() => router.push(`/dashboard/${searchSpaceId}`)}
-									className="flex items-center justify-center h-10 w-10 rounded-lg bg-primary/10 hover:bg-primary/20 transition-colors"
-									aria-label="Back to Dashboard"
-									type="button"
-								>
-									<ArrowLeft className="h-5 w-5 text-primary" />
-								</button>
-								<div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-1 ring-primary/10">
-									<Users className="h-6 w-6 text-primary" />
-								</div>
-								<div className="space-y-1">
-									<h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">
-										Team Management
-									</h1>
-									<p className="text-muted-foreground">
-										Manage members, roles, and invite links for your search space
-									</p>
-								</div>
-							</div>
-							<div className="flex items-center gap-2">
-								<Button onClick={handleRefresh} variant="outline" size="sm" className="gap-2">
-									<RefreshCw className="h-4 w-4" />
-									Refresh
-								</Button>
-							</div>
-						</div>
-						<Separator className="bg-gradient-to-r from-border via-border/50 to-transparent" />
-					</div>
+	const displayStart = totalItems > 0 ? pageIndex * PAGE_SIZE + 1 : 0;
+	const displayEnd = Math.min((pageIndex + 1) * PAGE_SIZE, totalItems);
+	const canPrev = pageIndex > 0;
+	const canNext = displayEnd < totalItems;
 
-					{/* Summary Cards */}
-					<motion.div variants={staggerContainer} className="grid grid-cols-1 md:grid-cols-3 gap-4">
-						<motion.div variants={cardVariants}>
-							<Card className="relative overflow-hidden border-none bg-gradient-to-br from-blue-500/10 via-blue-500/5 to-transparent">
-								<div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/10 rounded-full blur-3xl -mr-16 -mt-16" />
-								<CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-									<CardTitle className="text-sm font-medium">Total Members</CardTitle>
-									<Users className="h-5 w-5 text-blue-500" />
-								</CardHeader>
-								<CardContent>
-									<div className="text-3xl font-bold text-blue-600 dark:text-blue-400">
-										{members.length}
-									</div>
-									<p className="text-xs text-muted-foreground mt-1">
-										{members.filter((m) => m.is_owner).length} owner
-										{members.filter((m) => m.is_owner).length !== 1 ? "s" : ""}
-									</p>
-								</CardContent>
-							</Card>
-						</motion.div>
+	useEffect(() => {
+		if (members.length > 0 && !membersLoading) {
+			const ownerCount = members.filter((m) => m.is_owner).length;
+			trackSearchSpaceUsersViewed(searchSpaceId, members.length, ownerCount);
+		}
+	}, [members, membersLoading, searchSpaceId]);
 
-						<motion.div variants={cardVariants}>
-							<Card className="relative overflow-hidden border-none bg-gradient-to-br from-violet-500/10 via-violet-500/5 to-transparent">
-								<div className="absolute top-0 right-0 w-32 h-32 bg-violet-500/10 rounded-full blur-3xl -mr-16 -mt-16" />
-								<CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-									<CardTitle className="text-sm font-medium">Active Roles</CardTitle>
-									<Shield className="h-5 w-5 text-violet-500" />
-								</CardHeader>
-								<CardContent>
-									<div className="text-3xl font-bold text-violet-600 dark:text-violet-400">
-										{roles.length}
-									</div>
-									<p className="text-xs text-muted-foreground mt-1">
-										{roles.filter((r) => r.is_system_role).length} system roles
-									</p>
-								</CardContent>
-							</Card>
-						</motion.div>
-
-						<motion.div variants={cardVariants}>
-							<Card className="relative overflow-hidden border-none bg-gradient-to-br from-emerald-500/10 via-emerald-500/5 to-transparent">
-								<div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-3xl -mr-16 -mt-16" />
-								<CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-									<CardTitle className="text-sm font-medium">Active Invites</CardTitle>
-									<Link2 className="h-5 w-5 text-emerald-500" />
-								</CardHeader>
-								<CardContent>
-									<div className="text-3xl font-bold text-emerald-600 dark:text-emerald-400">
-										{invites.filter((i) => i.is_active).length}
-									</div>
-									<p className="text-xs text-muted-foreground mt-1">
-										{invites.reduce((acc, i) => acc + i.uses_count, 0)} total uses
-									</p>
-								</CardContent>
-							</Card>
-						</motion.div>
-					</motion.div>
-
-					{/* Tabs Content */}
-					<Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-6">
-						<div className="flex items-center justify-between">
-							<TabsList className="bg-muted/50 p-1">
-								<TabsTrigger value="members" className="gap-2 data-[state=active]:bg-background">
-									<Users className="h-4 w-4" />
-									<span>Members</span>
-									<Badge variant="secondary" className="ml-1 text-xs">
-										{members.length}
-									</Badge>
-								</TabsTrigger>
-								<TabsTrigger value="roles" className="gap-2 data-[state=active]:bg-background">
-									<Shield className="h-4 w-4" />
-									<span>Roles</span>
-									<Badge variant="secondary" className="ml-1 text-xs">
-										{roles.length}
-									</Badge>
-								</TabsTrigger>
-								<TabsTrigger value="invites" className="gap-2 data-[state=active]:bg-background">
-									<LinkIcon className="h-4 w-4" />
-									<span>Invites</span>
-									<Badge variant="secondary" className="ml-1 text-xs">
-										{invites.filter((i) => i.is_active).length}
-									</Badge>
-								</TabsTrigger>
-							</TabsList>
-
-							{activeTab === "invites" && canInvite && (
-								<CreateInviteDialog
-									roles={roles}
-									onCreateInvite={createInvite}
-									searchSpaceId={searchSpaceId}
-								/>
-							)}
-							{activeTab === "roles" && hasPermission("roles:create") && (
-								<CreateRoleDialog
-									groupedPermissions={groupedPermissions}
-									onCreateRole={createRole}
-								/>
-							)}
-						</div>
-
-						<TabsContent value="members" className="space-y-4">
-							<MembersTab
-								members={members}
-								roles={roles}
-								loading={membersLoading}
-								onUpdateRole={updateMemberRole}
-								onRemoveMember={removeMember}
-								canManageRoles={hasPermission("members:manage_roles")}
-								canRemove={hasPermission("members:remove")}
-							/>
-						</TabsContent>
-
-						<TabsContent value="roles" className="space-y-4">
-							<RolesTab
-								roles={roles}
-								groupedPermissions={groupedPermissions}
-								loading={rolesLoading}
-								onUpdateRole={updateRole}
-								onDeleteRole={deleteRole}
-								canUpdate={hasPermission("roles:update")}
-								canDelete={hasPermission("roles:delete")}
-							/>
-						</TabsContent>
-
-						<TabsContent value="invites" className="space-y-4">
-							<InvitesTab
-								invites={invites}
-								loading={invitesLoading}
-								onRevokeInvite={revokeInvite}
-								canRevoke={canInvite}
-							/>
-						</TabsContent>
-					</Tabs>
-				</motion.div>
-			</div>
-		</motion.div>
-	);
-}
-
-// ============ Members Tab ============
-
-function MembersTab({
-	members,
-	roles,
-	loading,
-	onUpdateRole,
-	onRemoveMember,
-	canManageRoles,
-	canRemove,
-}: {
-	members: Member[];
-	roles: Role[];
-	loading: boolean;
-	onUpdateRole: (membershipId: number, roleId: number | null) => Promise<Member>;
-	onRemoveMember: (membershipId: number) => Promise<boolean>;
-	canManageRoles: boolean;
-	canRemove: boolean;
-}) {
-	const [sorting, setSorting] = useState<SortingState>([]);
-	const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-	const [searchQuery, setSearchQuery] = useState("");
-
-	const filteredMembers = useMemo(() => {
-		if (!searchQuery) return members;
-		const query = searchQuery.toLowerCase();
-		return members.filter(
-			(m) =>
-				m.user_email?.toLowerCase().includes(query) || m.role?.name.toLowerCase().includes(query)
-		);
-	}, [members, searchQuery]);
-
-	if (loading) {
-		return (
-			<div className="flex items-center justify-center py-12">
-				<Loader2 className="h-8 w-8 text-primary animate-spin" />
-			</div>
-		);
-	}
-
-	return (
-		<motion.div
-			initial={{ opacity: 0, y: 10 }}
-			animate={{ opacity: 1, y: 0 }}
-			exit={{ opacity: 0, y: -10 }}
-			className="space-y-4"
-		>
-			{/* Search */}
-			<div className="flex items-center gap-4">
-				<div className="relative flex-1 max-w-sm">
-					<Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-					<Input
-						placeholder="Search members..."
-						value={searchQuery}
-						onChange={(e) => setSearchQuery(e.target.value)}
-						className="pl-9"
-					/>
-				</div>
-			</div>
-
-			{/* Members List */}
-			<div className="rounded-lg border bg-card overflow-hidden">
-				<Table>
-					<TableHeader>
-						<TableRow className="bg-muted/50">
-							<TableHead className="w-[300px]">Member</TableHead>
-							<TableHead>Role</TableHead>
-							<TableHead>Joined</TableHead>
-							<TableHead className="text-right">Actions</TableHead>
-						</TableRow>
-					</TableHeader>
-					<TableBody>
-						{filteredMembers.length === 0 ? (
-							<TableRow>
-								<TableCell colSpan={4} className="text-center py-12">
-									<div className="flex flex-col items-center gap-2">
-										<Users className="h-8 w-8 text-muted-foreground/50" />
-										<p className="text-muted-foreground">No members found</p>
-									</div>
-								</TableCell>
-							</TableRow>
-						) : (
-							filteredMembers.map((member, index) => (
-								<motion.tr
-									key={member.id}
-									initial={{ opacity: 0, y: 10 }}
-									animate={{ opacity: 1, y: 0 }}
-									transition={{ delay: index * 0.05 }}
-									className="group border-b transition-colors hover:bg-muted/50"
-								>
-									<TableCell>
-										<div className="flex items-center gap-3">
-											<div className="relative">
-												<div className="h-10 w-10 rounded-full bg-gradient-to-br from-primary/20 to-primary/5 flex items-center justify-center ring-2 ring-background">
-													<User className="h-5 w-5 text-primary" />
-												</div>
-												{member.is_owner && (
-													<div className="absolute -top-1 -right-1 h-5 w-5 rounded-full bg-amber-500 flex items-center justify-center ring-2 ring-background">
-														<Crown className="h-3 w-3 text-white" />
-													</div>
-												)}
-											</div>
-											<div>
-												<p className="font-medium">{member.user_email || "Unknown"}</p>
-												{member.is_owner && (
-													<Badge
-														variant="outline"
-														className="text-xs mt-1 bg-amber-500/10 text-amber-600 border-amber-500/20"
-													>
-														Owner
-													</Badge>
-												)}
-											</div>
-										</div>
-									</TableCell>
-									<TableCell>
-										{canManageRoles && !member.is_owner ? (
-											<Select
-												value={member.role_id?.toString() || "none"}
-												onValueChange={(value) =>
-													onUpdateRole(member.id, value === "none" ? null : Number(value))
-												}
-											>
-												<SelectTrigger className="w-[180px]">
-													<SelectValue placeholder="Select role" />
-												</SelectTrigger>
-												<SelectContent>
-													<SelectItem value="none">No role</SelectItem>
-													{roles.map((role) => (
-														<SelectItem key={role.id} value={role.id.toString()}>
-															<div className="flex items-center gap-2">
-																<Shield className="h-3 w-3" />
-																{role.name}
-															</div>
-														</SelectItem>
-													))}
-												</SelectContent>
-											</Select>
-										) : (
-											<Badge variant="secondary" className="gap-1">
-												<Shield className="h-3 w-3" />
-												{member.role?.name || "No role"}
-											</Badge>
-										)}
-									</TableCell>
-									<TableCell>
-										<div className="flex items-center gap-2 text-sm text-muted-foreground">
-											<Calendar className="h-4 w-4" />
-											{new Date(member.joined_at).toLocaleDateString()}
-										</div>
-									</TableCell>
-									<TableCell className="text-right">
-										{canRemove && !member.is_owner && (
-											<AlertDialog>
-												<AlertDialogTrigger asChild>
-													<Button
-														variant="ghost"
-														size="sm"
-														className="text-destructive hover:text-destructive hover:bg-destructive/10"
-													>
-														<UserMinus className="h-4 w-4" />
-													</Button>
-												</AlertDialogTrigger>
-												<AlertDialogContent>
-													<AlertDialogHeader>
-														<AlertDialogTitle>Remove member?</AlertDialogTitle>
-														<AlertDialogDescription>
-															This will remove{" "}
-															<span className="font-medium">{member.user_email}</span> from this
-															search space. They will lose access to all resources.
-														</AlertDialogDescription>
-													</AlertDialogHeader>
-													<AlertDialogFooter>
-														<AlertDialogCancel>Cancel</AlertDialogCancel>
-														<AlertDialogAction
-															onClick={() => onRemoveMember(member.id)}
-															className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-														>
-															Remove
-														</AlertDialogAction>
-													</AlertDialogFooter>
-												</AlertDialogContent>
-											</AlertDialog>
-										)}
-									</TableCell>
-								</motion.tr>
-							))
-						)}
-					</TableBody>
-				</Table>
-			</div>
-		</motion.div>
-	);
-}
-
-// ============ Roles Tab ============
-
-function RolesTab({
-	roles,
-	groupedPermissions,
-	loading,
-	onUpdateRole,
-	onDeleteRole,
-	canUpdate,
-	canDelete,
-}: {
-	roles: Role[];
-	groupedPermissions: Record<string, { value: string; name: string; category: string }[]>;
-	loading: boolean;
-	onUpdateRole: (roleId: number, data: { permissions?: string[] }) => Promise<Role>;
-	onDeleteRole: (roleId: number) => Promise<boolean>;
-	canUpdate: boolean;
-	canDelete: boolean;
-}) {
-	if (loading) {
-		return (
-			<div className="flex items-center justify-center py-12">
-				<Loader2 className="h-8 w-8 text-primary animate-spin" />
-			</div>
-		);
-	}
-
-	return (
-		<motion.div
-			initial={{ opacity: 0, y: 10 }}
-			animate={{ opacity: 1, y: 0 }}
-			exit={{ opacity: 0, y: -10 }}
-			className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
-		>
-			{roles.map((role, index) => (
-				<motion.div
-					key={role.id}
-					initial={{ opacity: 0, scale: 0.95 }}
-					animate={{ opacity: 1, scale: 1 }}
-					transition={{ delay: index * 0.05 }}
-				>
-					<Card
-						className={cn(
-							"relative overflow-hidden transition-all hover:shadow-lg",
-							role.is_system_role && "ring-1 ring-primary/20"
-						)}
-					>
-						{role.is_system_role && (
-							<div className="absolute top-0 right-0 px-2 py-1 bg-primary/10 text-primary text-xs font-medium rounded-bl-lg">
-								System Role
-							</div>
-						)}
-						<CardHeader>
-							<div className="flex items-start justify-between">
-								<div className="flex items-center gap-3">
-									<div
-										className={cn(
-											"h-10 w-10 rounded-lg flex items-center justify-center",
-											role.name === "Owner" && "bg-amber-500/20",
-											role.name === "Admin" && "bg-red-500/20",
-											role.name === "Editor" && "bg-blue-500/20",
-											role.name === "Viewer" && "bg-gray-500/20",
-											!["Owner", "Admin", "Editor", "Viewer"].includes(role.name) && "bg-primary/20"
-										)}
-									>
-										<ShieldCheck
-											className={cn(
-												"h-5 w-5",
-												role.name === "Owner" && "text-amber-600",
-												role.name === "Admin" && "text-red-600",
-												role.name === "Editor" && "text-blue-600",
-												role.name === "Viewer" && "text-gray-600",
-												!["Owner", "Admin", "Editor", "Viewer"].includes(role.name) &&
-													"text-primary"
-											)}
-										/>
-									</div>
-									<div>
-										<CardTitle className="text-lg">{role.name}</CardTitle>
-										{role.is_default && (
-											<Badge variant="outline" className="text-xs mt-1">
-												Default
-											</Badge>
-										)}
-									</div>
-								</div>
-								{!role.is_system_role && (
-									<DropdownMenu>
-										<DropdownMenuTrigger asChild>
-											<Button variant="ghost" size="icon" className="h-8 w-8">
-												<MoreHorizontal className="h-4 w-4" />
-											</Button>
-										</DropdownMenuTrigger>
-										<DropdownMenuContent align="end">
-											{canUpdate && (
-												<DropdownMenuItem>
-													<Edit2 className="h-4 w-4 mr-2" />
-													Edit Role
-												</DropdownMenuItem>
-											)}
-											{canDelete && (
-												<>
-													<DropdownMenuSeparator />
-													<AlertDialog>
-														<AlertDialogTrigger asChild>
-															<DropdownMenuItem
-																className="text-destructive focus:text-destructive"
-																onSelect={(e) => e.preventDefault()}
-															>
-																<Trash2 className="h-4 w-4 mr-2" />
-																Delete Role
-															</DropdownMenuItem>
-														</AlertDialogTrigger>
-														<AlertDialogContent>
-															<AlertDialogHeader>
-																<AlertDialogTitle>Delete role?</AlertDialogTitle>
-																<AlertDialogDescription>
-																	This will permanently delete the "{role.name}" role. Members with
-																	this role will lose their permissions.
-																</AlertDialogDescription>
-															</AlertDialogHeader>
-															<AlertDialogFooter>
-																<AlertDialogCancel>Cancel</AlertDialogCancel>
-																<AlertDialogAction
-																	onClick={() => onDeleteRole(role.id)}
-																	className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-																>
-																	Delete
-																</AlertDialogAction>
-															</AlertDialogFooter>
-														</AlertDialogContent>
-													</AlertDialog>
-												</>
-											)}
-										</DropdownMenuContent>
-									</DropdownMenu>
-								)}
-							</div>
-							{role.description && (
-								<CardDescription className="mt-2">{role.description}</CardDescription>
-							)}
-						</CardHeader>
-						<CardContent>
-							<div className="space-y-2">
-								<Label className="text-xs text-muted-foreground uppercase tracking-wide">
-									Permissions ({role.permissions.includes("*") ? "All" : role.permissions.length})
-								</Label>
-								<div className="flex flex-wrap gap-1">
-									{role.permissions.includes("*") ? (
-										<Badge
-											variant="default"
-											className="bg-gradient-to-r from-amber-500 to-orange-500"
-										>
-											Full Access
-										</Badge>
-									) : (
-										role.permissions.slice(0, 5).map((perm) => (
-											<Badge key={perm} variant="secondary" className="text-xs">
-												{perm.replace(":", " ")}
-											</Badge>
-										))
-									)}
-									{!role.permissions.includes("*") && role.permissions.length > 5 && (
-										<Badge variant="outline" className="text-xs">
-											+{role.permissions.length - 5} more
-										</Badge>
-									)}
-								</div>
-							</div>
-						</CardContent>
-					</Card>
-				</motion.div>
-			))}
-		</motion.div>
-	);
-}
-
-// ============ Invites Tab ============
-
-function InvitesTab({
-	invites,
-	loading,
-	onRevokeInvite,
-	canRevoke,
-}: {
-	invites: Invite[];
-	loading: boolean;
-	onRevokeInvite: (inviteId: number) => Promise<boolean>;
-	canRevoke: boolean;
-}) {
-	const [copiedId, setCopiedId] = useState<number | null>(null);
-
-	const copyInviteLink = useCallback((invite: Invite) => {
-		const link = `${window.location.origin}/invite/${invite.invite_code}`;
-		navigator.clipboard.writeText(link);
-		setCopiedId(invite.id);
-		toast.success("Invite link copied to clipboard");
-		setTimeout(() => setCopiedId(null), 2000);
-	}, []);
-
-	if (loading) {
-		return (
-			<div className="flex items-center justify-center py-12">
-				<Loader2 className="h-8 w-8 text-primary animate-spin" />
-			</div>
-		);
-	}
-
-	if (invites.length === 0) {
+	if (accessLoading || membersLoading) {
 		return (
 			<motion.div
-				initial={{ opacity: 0, y: 10 }}
-				animate={{ opacity: 1, y: 0 }}
-				className="flex flex-col items-center justify-center py-16 text-center"
+				initial={{ opacity: 0 }}
+				animate={{ opacity: 1 }}
+				transition={{ duration: 0.3 }}
+				className="bg-background select-none"
 			>
-				<div className="h-16 w-16 rounded-full bg-muted flex items-center justify-center mb-4">
-					<LinkIcon className="h-8 w-8 text-muted-foreground" />
+				<div className="container max-w-5xl mx-auto p-4 md:p-6 lg:p-8 pt-20 md:pt-24 lg:pt-28">
+					<div className="space-y-6">
+						<div className="flex items-center justify-between">
+							<Skeleton className="h-9 w-36 rounded-md" />
+							<Skeleton className="h-4 w-20" />
+						</div>
+						<div className="rounded-lg border border-border/40 bg-background overflow-hidden">
+							<Table className="table-fixed w-full">
+								<TableHeader>
+									<TableRow className="hover:bg-transparent border-b border-border/40">
+										<TableHead className="w-[45%] px-4 md:px-6 border-r border-border/40">
+											<Skeleton className="h-3 w-16" />
+										</TableHead>
+										<TableHead className="hidden md:table-cell w-[25%] border-r border-border/40">
+											<Skeleton className="h-3 w-24" />
+										</TableHead>
+										<TableHead className="w-[30%] px-4 md:px-6">
+											<div className="flex justify-end">
+												<Skeleton className="h-3 w-12" />
+											</div>
+										</TableHead>
+									</TableRow>
+								</TableHeader>
+								<TableBody>
+									{Array.from({ length: PAGE_SIZE }).map((_, i) => (
+										<TableRow
+											key={`skeleton-${i}`}
+											className="border-b border-border/40 hover:bg-transparent"
+										>
+											<TableCell className="w-[45%] py-2.5 px-4 md:px-6 border-r border-border/40">
+												<div className="flex items-center gap-3">
+													<Skeleton className="h-10 w-10 rounded-full shrink-0" />
+													<div className="flex-1 min-w-0 space-y-1.5">
+														<Skeleton className="h-4 w-[60%]" />
+														<Skeleton className="h-3 w-[40%]" />
+													</div>
+												</div>
+											</TableCell>
+											<TableCell className="hidden md:table-cell w-[25%] py-2.5 border-r border-border/40">
+												<Skeleton className="h-4 w-24" />
+											</TableCell>
+											<TableCell className="w-[30%] py-2.5 px-4 md:px-6">
+												<div className="flex justify-end">
+													<Skeleton className="h-4 w-16" />
+												</div>
+											</TableCell>
+										</TableRow>
+									))}
+								</TableBody>
+							</Table>
+						</div>
+					</div>
 				</div>
-				<h3 className="text-lg font-medium mb-1">No invite links</h3>
-				<p className="text-muted-foreground max-w-sm">
-					Create an invite link to allow others to join your search space with specific roles.
-				</p>
 			</motion.div>
 		);
 	}
 
 	return (
 		<motion.div
-			initial={{ opacity: 0, y: 10 }}
-			animate={{ opacity: 1, y: 0 }}
-			exit={{ opacity: 0, y: -10 }}
-			className="space-y-4"
+			initial={{ opacity: 0 }}
+			animate={{ opacity: 1 }}
+			transition={{ duration: 0.3 }}
+			className="bg-background select-none"
 		>
-			{invites.map((invite, index) => {
-				const isExpired = invite.expires_at && new Date(invite.expires_at) < new Date();
-				const isMaxedOut = invite.max_uses && invite.uses_count >= invite.max_uses;
-				const isInactive = !invite.is_active || isExpired || isMaxedOut;
+			<div className="container max-w-5xl mx-auto p-4 md:p-6 lg:p-8 pt-20 md:pt-24 lg:pt-28">
+				<div className="space-y-6">
+					{/* Header row: Invite button on left, member count on right */}
+					<div className="flex items-center justify-between">
+						<div className="flex items-center gap-2">
+							{canInvite && (
+								<CreateInviteDialog
+									roles={roles}
+									onCreateInvite={handleCreateInvite}
+									searchSpaceId={searchSpaceId}
+								/>
+							)}
+							{canInvite && activeInvites.length > 0 && (
+								<AllInvitesDialog invites={activeInvites} onRevokeInvite={handleRevokeInvite} />
+							)}
+						</div>
+						<p className="hidden md:block text-sm text-muted-foreground">
+							{members.length} {members.length === 1 ? "member" : "members"}
+						</p>
+					</div>
 
-				return (
-					<motion.div
-						key={invite.id}
-						initial={{ opacity: 0, x: -20 }}
-						animate={{ opacity: 1, x: 0 }}
-						transition={{ delay: index * 0.05 }}
-					>
-						<Card
-							className={cn("relative overflow-hidden transition-all", isInactive && "opacity-60")}
+					{/* Members & Invites Table */}
+					<div className="rounded-lg border border-border/40 bg-background overflow-hidden">
+						<Table className="table-fixed w-full">
+							<TableHeader>
+								<TableRow className="hover:bg-transparent border-b border-border/40">
+									<TableHead className="w-[45%] px-4 md:px-6 border-r border-border/40">
+										<span className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground/70">
+											<User size={14} className="opacity-60 text-muted-foreground" />
+											Name
+										</span>
+									</TableHead>
+									<TableHead className="hidden md:table-cell w-[25%] border-r border-border/40">
+										<span className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground/70">
+											<Clock size={14} className="opacity-60 text-muted-foreground" />
+											Last logged in
+										</span>
+									</TableHead>
+									<TableHead className="w-[30%] px-4 md:px-6">
+										<span className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground/70 justify-end">
+											<ShieldUser size={14} className="opacity-60 text-muted-foreground" />
+											Role
+										</span>
+									</TableHead>
+								</TableRow>
+							</TableHeader>
+							<TableBody>
+								{owners.map((member, index) => (
+									<MemberRow
+										key={`member-${member.id}`}
+										member={member}
+										roles={roles}
+										canManageRoles={canManageRoles}
+										canRemove={canRemove}
+										onUpdateRole={handleUpdateMember}
+										onRemoveMember={handleRemoveMember}
+										searchSpaceId={searchSpaceId}
+										index={index}
+									/>
+								))}
+								{paginatedMembers.map((member, index) => (
+									<MemberRow
+										key={`member-${member.id}`}
+										member={member}
+										roles={roles}
+										canManageRoles={canManageRoles}
+										canRemove={canRemove}
+										onUpdateRole={handleUpdateMember}
+										onRemoveMember={handleRemoveMember}
+										searchSpaceId={searchSpaceId}
+										index={owners.length + index}
+									/>
+								))}
+								{members.length === 0 && (
+									<TableRow>
+										<TableCell colSpan={3} className="text-center py-12">
+											<div className="flex flex-col items-center gap-2">
+												<Users className="h-8 w-8 text-muted-foreground/50" />
+												<p className="text-muted-foreground">No members yet</p>
+											</div>
+										</TableCell>
+									</TableRow>
+								)}
+							</TableBody>
+						</Table>
+					</div>
+
+					{/* Pagination */}
+					{totalItems > PAGE_SIZE && (
+						<motion.div
+							className="flex items-center justify-end gap-3 py-3 px-2"
+							initial={{ opacity: 0, y: 10 }}
+							animate={{ opacity: 1, y: 0 }}
+							transition={{ type: "spring", stiffness: 300, damping: 30, delay: 0.3 }}
 						>
-							<CardContent className="p-4">
-								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-4 flex-1 min-w-0">
-										<div
-											className={cn(
-												"h-12 w-12 rounded-xl flex items-center justify-center shrink-0",
-												invite.is_active && !isExpired && !isMaxedOut
-													? "bg-emerald-500/20"
-													: "bg-muted"
-											)}
-										>
-											<Link2
-												className={cn(
-													"h-6 w-6",
-													invite.is_active && !isExpired && !isMaxedOut
-														? "text-emerald-600"
-														: "text-muted-foreground"
-												)}
-											/>
-										</div>
-										<div className="flex-1 min-w-0">
-											<div className="flex items-center gap-2 flex-wrap">
-												<p className="font-medium truncate">{invite.name || "Unnamed Invite"}</p>
-												{isExpired && (
-													<Badge variant="destructive" className="text-xs">
-														Expired
-													</Badge>
-												)}
-												{isMaxedOut && (
-													<Badge variant="secondary" className="text-xs">
-														Max uses reached
-													</Badge>
-												)}
-												{!invite.is_active && !isExpired && !isMaxedOut && (
-													<Badge variant="secondary" className="text-xs">
-														Inactive
-													</Badge>
-												)}
-											</div>
-											<div className="flex items-center gap-4 mt-1 text-sm text-muted-foreground flex-wrap">
-												<span className="flex items-center gap-1">
-													<Shield className="h-3 w-3" />
-													{invite.role?.name || "Default role"}
-												</span>
-												<span className="flex items-center gap-1">
-													<Hash className="h-3 w-3" />
-													{invite.uses_count} uses
-													{invite.max_uses && ` / ${invite.max_uses}`}
-												</span>
-												{invite.expires_at && (
-													<span className="flex items-center gap-1">
-														<Clock className="h-3 w-3" />
-														{isExpired
-															? "Expired"
-															: `Expires ${new Date(invite.expires_at).toLocaleDateString()}`}
-													</span>
-												)}
-											</div>
-										</div>
-									</div>
-									<div className="flex items-center gap-2 shrink-0">
-										<Button
-											variant="outline"
-											size="sm"
-											className="gap-2"
-											onClick={() => copyInviteLink(invite)}
-											disabled={isInactive}
-										>
-											{copiedId === invite.id ? (
-												<>
-													<Check className="h-4 w-4 text-emerald-500" />
-													Copied!
-												</>
-											) : (
-												<>
-													<Copy className="h-4 w-4" />
-													Copy Link
-												</>
-											)}
-										</Button>
-										{canRevoke && (
-											<AlertDialog>
-												<AlertDialogTrigger asChild>
-													<Button
-														variant="ghost"
-														size="icon"
-														className="h-9 w-9 text-destructive hover:text-destructive hover:bg-destructive/10"
-													>
-														<Trash2 className="h-4 w-4" />
-													</Button>
-												</AlertDialogTrigger>
-												<AlertDialogContent>
-													<AlertDialogHeader>
-														<AlertDialogTitle>Revoke invite?</AlertDialogTitle>
-														<AlertDialogDescription>
-															This will permanently delete this invite link. Anyone with this link
-															will no longer be able to join.
-														</AlertDialogDescription>
-													</AlertDialogHeader>
-													<AlertDialogFooter>
-														<AlertDialogCancel>Cancel</AlertDialogCancel>
-														<AlertDialogAction
-															onClick={() => onRevokeInvite(invite.id)}
-															className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-														>
-															Revoke
-														</AlertDialogAction>
-													</AlertDialogFooter>
-												</AlertDialogContent>
-											</AlertDialog>
-										)}
-									</div>
-								</div>
-							</CardContent>
-						</Card>
-					</motion.div>
-				);
-			})}
+							<span className="text-sm text-muted-foreground tabular-nums">
+								{displayStart}-{displayEnd} of {totalItems}
+							</span>
+							<div className="flex items-center gap-1">
+								<Button
+									variant="ghost"
+									size="icon"
+									className="h-8 w-8 disabled:opacity-40"
+									onClick={() => setPageIndex(0)}
+									disabled={!canPrev}
+									aria-label="Go to first page"
+								>
+									<ChevronFirst size={18} strokeWidth={2} />
+								</Button>
+								<Button
+									variant="ghost"
+									size="icon"
+									className="h-8 w-8 disabled:opacity-40"
+									onClick={() => setPageIndex((i) => Math.max(0, i - 1))}
+									disabled={!canPrev}
+									aria-label="Go to previous page"
+								>
+									<ChevronLeft size={18} strokeWidth={2} />
+								</Button>
+								<Button
+									variant="ghost"
+									size="icon"
+									className="h-8 w-8 disabled:opacity-40"
+									onClick={() => setPageIndex((i) => (canNext ? i + 1 : i))}
+									disabled={!canNext}
+									aria-label="Go to next page"
+								>
+									<ChevronRight size={18} strokeWidth={2} />
+								</Button>
+								<Button
+									variant="ghost"
+									size="icon"
+									className="h-8 w-8 disabled:opacity-40"
+									onClick={() => setPageIndex(lastPage)}
+									disabled={!canNext}
+									aria-label="Go to last page"
+								>
+									<ChevronLast size={18} strokeWidth={2} />
+								</Button>
+							</div>
+						</motion.div>
+					)}
+				</div>
+			</div>
 		</motion.div>
+	);
+}
+
+// ============ Member Row ============
+
+function MemberRow({
+	member,
+	roles,
+	canManageRoles,
+	canRemove,
+	onUpdateRole,
+	onRemoveMember,
+	searchSpaceId,
+	index,
+}: {
+	member: Membership;
+	roles: Role[];
+	canManageRoles: boolean;
+	canRemove: boolean;
+	onUpdateRole: (membershipId: number, roleId: number | null) => Promise<Membership>;
+	onRemoveMember: (membershipId: number) => Promise<boolean>;
+	searchSpaceId: number;
+	index: number;
+}) {
+	const router = useRouter();
+	const initials = getAvatarInitials(member);
+	const avatarColor = getAvatarColor(member.user_id);
+	const displayName = member.user_display_name || member.user_email || "Unknown";
+	const roleName = member.is_owner ? "Owner" : member.role?.name || "No role";
+	const showActions = !member.is_owner && (canManageRoles || canRemove);
+
+	return (
+		<motion.tr
+			initial={{ opacity: 0 }}
+			animate={{ opacity: 1, transition: { duration: 0.2, delay: index * 0.02 } }}
+			className="border-b border-border/40 transition-colors hover:bg-muted/30"
+		>
+			<TableCell className="w-[45%] py-2.5 px-4 md:px-6 max-w-0 border-r border-border/40">
+				<div className="flex items-center gap-3">
+					<div className="shrink-0">
+						{member.user_avatar_url ? (
+							<Image
+								src={member.user_avatar_url}
+								alt={displayName}
+								width={40}
+								height={40}
+								className="h-10 w-10 rounded-full object-cover"
+							/>
+						) : (
+							<div
+								className={cn(
+									"h-10 w-10 rounded-full flex items-center justify-center text-white font-medium text-sm",
+									avatarColor
+								)}
+							>
+								{initials}
+							</div>
+						)}
+					</div>
+					<div className="min-w-0">
+						<p className="font-medium text-sm truncate select-text">{displayName}</p>
+						{member.user_display_name && member.user_email && (
+							<p className="text-xs text-muted-foreground truncate select-text">
+								{member.user_email}
+							</p>
+						)}
+					</div>
+				</div>
+			</TableCell>
+
+			<TableCell className="hidden md:table-cell w-[25%] py-2.5 text-sm text-foreground border-r border-border/40">
+				{formatRelativeDate(member.joined_at)}
+			</TableCell>
+
+			<TableCell className="w-[30%] text-right py-2.5 px-4 md:px-6">
+				{showActions ? (
+					<DropdownMenu>
+						<DropdownMenuTrigger asChild>
+							<button
+								type="button"
+								className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+							>
+								{roleName}
+								<ChevronDown className="h-4 w-4" />
+							</button>
+						</DropdownMenuTrigger>
+						<DropdownMenuContent
+							align="end"
+							onCloseAutoFocus={(e) => e.preventDefault()}
+							className="min-w-[120px] bg-muted dark:border dark:border-neutral-700"
+						>
+							{canManageRoles &&
+								roles
+									.filter((r) => r.name !== "Owner")
+									.map((role) => (
+										<DropdownMenuItem
+											key={role.id}
+											onClick={() => onUpdateRole(member.id, role.id)}
+										>
+											Make {role.name}
+										</DropdownMenuItem>
+									))}
+							{canRemove && (
+								<AlertDialog>
+									<AlertDialogTrigger asChild>
+										<DropdownMenuItem
+											className="text-destructive focus:text-destructive"
+											onSelect={(e) => e.preventDefault()}
+										>
+											Remove
+										</DropdownMenuItem>
+									</AlertDialogTrigger>
+									<AlertDialogContent>
+										<AlertDialogHeader>
+											<AlertDialogTitle>Remove member?</AlertDialogTitle>
+											<AlertDialogDescription>
+												This will remove <span className="font-medium">{member.user_email}</span>{" "}
+												from this search space. They will lose access to all resources.
+											</AlertDialogDescription>
+										</AlertDialogHeader>
+										<AlertDialogFooter>
+											<AlertDialogCancel>Cancel</AlertDialogCancel>
+											<AlertDialogAction
+												onClick={() => onRemoveMember(member.id)}
+												className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+											>
+												Remove
+											</AlertDialogAction>
+										</AlertDialogFooter>
+									</AlertDialogContent>
+								</AlertDialog>
+							)}
+							<DropdownMenuSeparator className="dark:bg-neutral-700" />
+							<DropdownMenuItem
+								onClick={() =>
+									router.push(`/dashboard/${searchSpaceId}/settings?section=team-roles`)
+								}
+							>
+								Manage Roles
+							</DropdownMenuItem>
+						</DropdownMenuContent>
+					</DropdownMenu>
+				) : (
+					<span className="text-sm text-foreground">{roleName}</span>
+				)}
+			</TableCell>
+		</motion.tr>
 	);
 }
 
@@ -946,7 +633,7 @@ function CreateInviteDialog({
 	searchSpaceId,
 }: {
 	roles: Role[];
-	onCreateInvite: (data: InviteCreate) => Promise<Invite>;
+	onCreateInvite: (data: CreateInviteRequest["data"]) => Promise<Invite>;
 	searchSpaceId: number;
 }) {
 	const [open, setOpen] = useState(false);
@@ -958,17 +645,33 @@ function CreateInviteDialog({
 	const [createdInvite, setCreatedInvite] = useState<Invite | null>(null);
 	const [copiedLink, setCopiedLink] = useState(false);
 
+	const assignableRoles = useMemo(() => roles.filter((r) => r.name !== "Owner"), [roles]);
+	const defaultRole = useMemo(() => assignableRoles.find((r) => r.is_default), [assignableRoles]);
+
+	useEffect(() => {
+		if (defaultRole && !roleId) {
+			setRoleId(defaultRole.id.toString());
+		}
+	}, [defaultRole, roleId]);
+
 	const handleCreate = async () => {
 		setCreating(true);
 		try {
-			const data: InviteCreate = {};
+			const data: CreateInviteRequest["data"] = {};
 			if (name) data.name = name;
-			if (roleId && roleId !== "default") data.role_id = Number(roleId);
+			if (roleId) data.role_id = Number(roleId);
 			if (maxUses) data.max_uses = Number(maxUses);
 			if (expiresAt) data.expires_at = expiresAt.toISOString();
 
 			const invite = await onCreateInvite(data);
 			setCreatedInvite(invite);
+
+			const roleName = roleId ? roles.find((r) => r.id.toString() === roleId)?.name : undefined;
+			trackSearchSpaceInviteSent(searchSpaceId, {
+				roleName,
+				hasExpiry: !!expiresAt,
+				hasMaxUses: !!maxUses,
+			});
 		} catch (error) {
 			console.error("Failed to create invite:", error);
 		} finally {
@@ -979,7 +682,7 @@ function CreateInviteDialog({
 	const handleClose = () => {
 		setOpen(false);
 		setName("");
-		setRoleId("");
+		setRoleId(defaultRole?.id.toString() ?? "");
 		setMaxUses("");
 		setExpiresAt(undefined);
 		setCreatedInvite(null);
@@ -997,12 +700,18 @@ function CreateInviteDialog({
 	return (
 		<Dialog open={open} onOpenChange={(v) => (v ? setOpen(true) : handleClose())}>
 			<DialogTrigger asChild>
-				<Button className="gap-2">
+				<Button
+					variant="outline"
+					className="gap-2 bg-black text-white dark:bg-white dark:text-black hover:bg-black/90 dark:hover:bg-white/90"
+				>
 					<UserPlus className="h-4 w-4" />
-					Create Invite
+					Invite members
 				</Button>
 			</DialogTrigger>
-			<DialogContent className="sm:max-w-md">
+			<DialogContent
+				className="w-[92vw] max-w-[92vw] sm:max-w-md p-4 md:p-6 select-none"
+				onOpenAutoFocus={(e) => e.preventDefault()}
+			>
 				{createdInvite ? (
 					<>
 						<DialogHeader>
@@ -1014,22 +723,17 @@ function CreateInviteDialog({
 								Share this link to invite people to your search space.
 							</DialogDescription>
 						</DialogHeader>
-						<div className="space-y-4 py-4">
+						<div className="space-y-3 py-2 md:py-4">
 							<div className="flex items-center gap-2 p-3 bg-muted rounded-lg">
 								<code className="flex-1 min-w-0 text-sm break-all">
 									{window.location.origin}/invite/{createdInvite.invite_code}
 								</code>
 								<Button variant="outline" size="sm" onClick={copyLink} className="shrink-0">
-									{copiedLink ? (
-										<Check className="h-4 w-4 text-emerald-500" />
-									) : (
-										<Copy className="h-4 w-4" />
-									)}
+									{copiedLink ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
 								</Button>
 							</div>
 							<div className="flex flex-wrap gap-2 text-sm text-muted-foreground">
 								<span className="flex items-center gap-1">
-									<Shield className="h-3 w-3" />
 									{createdInvite.role?.name || "Default role"}
 								</span>
 								{createdInvite.max_uses && (
@@ -1053,12 +757,12 @@ function CreateInviteDialog({
 				) : (
 					<>
 						<DialogHeader>
-							<DialogTitle>Create Invite Link</DialogTitle>
+							<DialogTitle>Invite Members</DialogTitle>
 							<DialogDescription>
 								Create a link to invite people to this search space.
 							</DialogDescription>
 						</DialogHeader>
-						<div className="space-y-4 py-4">
+						<div className="space-y-3 py-2 md:py-4">
 							<div className="space-y-2">
 								<Label htmlFor="invite-name">Name (optional)</Label>
 								<Input
@@ -1072,24 +776,23 @@ function CreateInviteDialog({
 								<Label htmlFor="invite-role">Role</Label>
 								<Select value={roleId} onValueChange={setRoleId}>
 									<SelectTrigger>
-										<SelectValue placeholder="Select a role (default: Viewer)" />
+										<SelectValue placeholder="Assign a role" />
 									</SelectTrigger>
 									<SelectContent>
-										<SelectItem value="default">Default role (Viewer)</SelectItem>
-										{roles
-											.filter((r) => r.name !== "Owner")
-											.map((role) => (
-												<SelectItem key={role.id} value={role.id.toString()}>
-													<div className="flex items-center gap-2">
-														<Shield className="h-3 w-3" />
-														{role.name}
-													</div>
-												</SelectItem>
-											))}
+										{assignableRoles.map((role) => (
+											<SelectItem key={role.id} value={role.id.toString()}>
+												<span className="flex items-center gap-2">
+													{role.name}
+													{role.is_default && (
+														<span className="text-xs text-muted-foreground">(default)</span>
+													)}
+												</span>
+											</SelectItem>
+										))}
 									</SelectContent>
 								</Select>
 							</div>
-							<div className="grid grid-cols-2 gap-4">
+							<div className="flex flex-col md:grid md:grid-cols-2 gap-3 md:gap-4">
 								<div className="space-y-2">
 									<Label htmlFor="max-uses">Max uses (optional)</Label>
 									<Input
@@ -1136,8 +839,8 @@ function CreateInviteDialog({
 							<Button onClick={handleCreate} disabled={creating}>
 								{creating ? (
 									<>
-										<Loader2 className="h-4 w-4 mr-2 animate-spin" />
-										Creating...
+										<Spinner size="sm" className="mr-2" />
+										Creating
 									</>
 								) : (
 									"Create Invite"
@@ -1151,174 +854,122 @@ function CreateInviteDialog({
 	);
 }
 
-// ============ Create Role Dialog ============
+// ============ All Invites Dialog ============
 
-function CreateRoleDialog({
-	groupedPermissions,
-	onCreateRole,
+function AllInvitesDialog({
+	invites,
+	onRevokeInvite,
 }: {
-	groupedPermissions: Record<string, { value: string; name: string; category: string }[]>;
-	onCreateRole: (data: RoleCreate) => Promise<Role>;
+	invites: Invite[];
+	onRevokeInvite: (inviteId: number) => Promise<boolean>;
 }) {
-	const [open, setOpen] = useState(false);
-	const [creating, setCreating] = useState(false);
-	const [name, setName] = useState("");
-	const [description, setDescription] = useState("");
-	const [selectedPermissions, setSelectedPermissions] = useState<string[]>([]);
-	const [isDefault, setIsDefault] = useState(false);
+	const [copiedId, setCopiedId] = useState<number | null>(null);
 
-	const handleCreate = async () => {
-		if (!name.trim()) {
-			toast.error("Please enter a role name");
-			return;
-		}
-
-		setCreating(true);
-		try {
-			await onCreateRole({
-				name: name.trim(),
-				description: description.trim() || undefined,
-				permissions: selectedPermissions,
-				is_default: isDefault,
-			});
-			setOpen(false);
-			setName("");
-			setDescription("");
-			setSelectedPermissions([]);
-			setIsDefault(false);
-		} catch (error) {
-			console.error("Failed to create role:", error);
-		} finally {
-			setCreating(false);
-		}
-	};
-
-	const togglePermission = (perm: string) => {
-		setSelectedPermissions((prev) =>
-			prev.includes(perm) ? prev.filter((p) => p !== perm) : [...prev, perm]
-		);
-	};
-
-	const toggleCategory = (category: string) => {
-		const categoryPerms = groupedPermissions[category]?.map((p) => p.value) || [];
-		const allSelected = categoryPerms.every((p) => selectedPermissions.includes(p));
-
-		if (allSelected) {
-			setSelectedPermissions((prev) => prev.filter((p) => !categoryPerms.includes(p)));
-		} else {
-			setSelectedPermissions((prev) => [...new Set([...prev, ...categoryPerms])]);
-		}
+	const copyLink = (invite: Invite) => {
+		const link = `${window.location.origin}/invite/${invite.invite_code}`;
+		navigator.clipboard.writeText(link);
+		setCopiedId(invite.id);
+		toast.success("Invite link copied");
+		setTimeout(() => setCopiedId(null), 2000);
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={setOpen}>
+		<Dialog>
 			<DialogTrigger asChild>
-				<Button className="gap-2">
-					<Plus className="h-4 w-4" />
-					Create Role
+				<Button variant="outline" className="gap-2">
+					<Link2 className="h-4 w-4 rotate-315" />
+					Active invites
+					<span className="inline-flex items-center justify-center h-5 min-w-5 px-1 rounded-full bg-muted text-xs font-medium">
+						{invites.length}
+					</span>
 				</Button>
 			</DialogTrigger>
-			<DialogContent className="sm:max-w-xl">
+			<DialogContent className="w-[92vw] max-w-[92vw] sm:max-w-lg p-4 md:p-6 select-none">
 				<DialogHeader>
-					<DialogTitle>Create Custom Role</DialogTitle>
+					<DialogTitle className="flex items-center gap-2">Active Invite Links</DialogTitle>
 					<DialogDescription>
-						Define a new role with specific permissions for this search space.
+						{invites.length} active {invites.length === 1 ? "invite" : "invites"}. Copy a link or
+						revoke access.
 					</DialogDescription>
 				</DialogHeader>
-				<div className="space-y-4 py-4">
-					<div className="grid grid-cols-2 gap-4">
-						<div className="space-y-2">
-							<Label htmlFor="role-name">Role Name *</Label>
-							<Input
-								id="role-name"
-								placeholder="e.g., Contributor"
-								value={name}
-								onChange={(e) => setName(e.target.value)}
-							/>
-						</div>
-						<div className="space-y-2">
-							<Label className="flex items-center gap-2">
-								<Checkbox checked={isDefault} onCheckedChange={(v) => setIsDefault(!!v)} />
-								Set as default role
-							</Label>
-							<p className="text-xs text-muted-foreground">
-								New invites without a role will use this
-							</p>
-						</div>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="role-description">Description</Label>
-						<Textarea
-							id="role-description"
-							placeholder="Describe what this role can do..."
-							value={description}
-							onChange={(e) => setDescription(e.target.value)}
-							rows={2}
-						/>
-					</div>
-					<div className="space-y-2">
-						<Label>Permissions ({selectedPermissions.length} selected)</Label>
-						<ScrollArea className="h-64 rounded-lg border p-4">
-							<div className="space-y-4">
-								{Object.entries(groupedPermissions).map(([category, perms]) => {
-									const categorySelected = perms.filter((p) =>
-										selectedPermissions.includes(p.value)
-									).length;
-									const allSelected = categorySelected === perms.length;
-
-									return (
-										<div key={category} className="space-y-2">
-											<button
-												type="button"
-												className="flex items-center gap-2 cursor-pointer hover:bg-muted/50 p-1 rounded w-full text-left"
-												onClick={() => toggleCategory(category)}
+				<div className="max-h-[320px] overflow-y-auto -mx-1 px-1 space-y-3 py-2">
+					{invites.map((invite) => (
+						<div key={invite.id} className="rounded-lg border border-border/40 p-3 space-y-2.5">
+							<div className="flex items-center justify-between gap-2">
+								<div className="flex items-center gap-2 min-w-0">
+									<p className="text-sm font-medium truncate">{invite.name || "Unnamed invite"}</p>
+									<div className="flex flex-wrap gap-x-2 text-xs text-muted-foreground shrink-0">
+										{invite.role?.name && (
+											<span className="rounded bg-muted px-1.5 py-0.5">{invite.role.name}</span>
+										)}
+										{invite.max_uses != null && (
+											<span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5">
+												<Hash className="h-3 w-3" />
+												{invite.uses_count}/{invite.max_uses}
+											</span>
+										)}
+										{invite.expires_at && (
+											<span className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5">
+												<Clock className="h-3 w-3" />
+												{new Date(invite.expires_at).toLocaleDateString()}
+											</span>
+										)}
+									</div>
+								</div>
+								<AlertDialog>
+									<AlertDialogTrigger asChild>
+										<Button
+											variant="ghost"
+											size="icon"
+											className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
+										>
+											<Trash2 className="h-3.5 w-3.5" />
+										</Button>
+									</AlertDialogTrigger>
+									<AlertDialogContent>
+										<AlertDialogHeader>
+											<AlertDialogTitle>Revoke invite?</AlertDialogTitle>
+											<AlertDialogDescription>
+												This will permanently delete this invite link. Anyone with this link will no
+												longer be able to join.
+											</AlertDialogDescription>
+										</AlertDialogHeader>
+										<AlertDialogFooter>
+											<AlertDialogCancel>Cancel</AlertDialogCancel>
+											<AlertDialogAction
+												onClick={() => onRevokeInvite(invite.id)}
+												className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
 											>
-												<Checkbox
-													checked={allSelected}
-													onCheckedChange={() => toggleCategory(category)}
-												/>
-												<span className="text-sm font-medium capitalize">
-													{category} ({categorySelected}/{perms.length})
-												</span>
-											</button>
-											<div className="grid grid-cols-2 gap-2 ml-6">
-												{perms.map((perm) => (
-													<button
-														type="button"
-														key={perm.value}
-														className="flex items-center gap-2 cursor-pointer text-left"
-														onClick={() => togglePermission(perm.value)}
-													>
-														<Checkbox
-															checked={selectedPermissions.includes(perm.value)}
-															onCheckedChange={() => togglePermission(perm.value)}
-														/>
-														<span className="text-xs">{perm.value.split(":")[1]}</span>
-													</button>
-												))}
-											</div>
-										</div>
-									);
-								})}
+												Revoke
+											</AlertDialogAction>
+										</AlertDialogFooter>
+									</AlertDialogContent>
+								</AlertDialog>
 							</div>
-						</ScrollArea>
-					</div>
+							<div className="flex items-center gap-2 rounded-md bg-muted p-2">
+								<div className="flex-1 min-w-0 overflow-x-auto scrollbar-hide">
+									<code className="text-sm select-all whitespace-nowrap">
+										{typeof window !== "undefined"
+											? `${window.location.origin}/invite/${invite.invite_code}`
+											: `/invite/${invite.invite_code}`}
+									</code>
+								</div>
+								<Button
+									variant="ghost"
+									size="sm"
+									className="shrink-0"
+									onClick={() => copyLink(invite)}
+								>
+									{copiedId === invite.id ? (
+										<Check className="h-4 w-4" />
+									) : (
+										<Copy className="h-4 w-4" />
+									)}
+								</Button>
+							</div>
+						</div>
+					))}
 				</div>
-				<DialogFooter>
-					<Button variant="outline" onClick={() => setOpen(false)}>
-						Cancel
-					</Button>
-					<Button onClick={handleCreate} disabled={creating || !name.trim()}>
-						{creating ? (
-							<>
-								<Loader2 className="h-4 w-4 mr-2 animate-spin" />
-								Creating...
-							</>
-						) : (
-							"Create Role"
-						)}
-					</Button>
-				</DialogFooter>
 			</DialogContent>
 		</Dialog>
 	);

@@ -128,7 +128,7 @@ export const LLM_PROVIDERS: LLMProvider[] = [
 	{
 		value: "ZHIPU",
 		label: "Zhipu (GLM)",
-		example: "openrouter/z-ai/glm-4.6",
+		example: "glm-4.6, glm-4.6:exacto",
 		description: "GLM series models",
 		apiBase: "https://open.bigmodel.cn/api/paas/v4",
 	},
@@ -173,6 +173,13 @@ export const LLM_PROVIDERS: LLMProvider[] = [
 		label: "Databricks",
 		example: "databricks/databricks-meta-llama-3-3-70b-instruct",
 		description: "Databricks Model Serving",
+	},
+	{
+		value: "GITHUB_MODELS",
+		label: "GitHub Models",
+		example: "openai/gpt-5, meta/llama-3.1-405b-instruct",
+		description: "AI models from GitHub Marketplace",
+		apiBase: "https://models.github.ai/inference",
 	},
 	{
 		value: "CUSTOM",

@@ -1,8 +1,10 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useEffect } from "react";
-import { getAndClearRedirectPath, setBearerToken } from "@/lib/auth-utils";
+import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
+import { getAndClearRedirectPath, setBearerToken, setRefreshToken } from "@/lib/auth-utils";
+import { trackLoginSuccess } from "@/lib/posthog/events";
 
 interface TokenHandlerProps {
 	redirectPath?: string; // Default path to redirect after storing token (if no saved path)
@@ -24,21 +26,39 @@ const TokenHandler = ({
 	tokenParamName = "token",
 	storageKey = "surfsense_bearer_token",
 }: TokenHandlerProps) => {
-	const router = useRouter();
 	const searchParams = useSearchParams();
+
+	// Always show loading for this component - spinner animation won't reset
+	useGlobalLoadingEffect(true);
 
 	useEffect(() => {
 		// Only run on client-side
 		if (typeof window === "undefined") return;
 
-		// Get token from URL parameters
+		// Get tokens from URL parameters
 		const token = searchParams.get(tokenParamName);
+		const refreshToken = searchParams.get("refresh_token");
 
 		if (token) {
 			try {
-				// Store token in localStorage using both methods for compatibility
+				// Track login success for OAuth flows (e.g., Google)
+				// Local login already tracks success before redirecting here
+				const alreadyTracked = sessionStorage.getItem("login_success_tracked");
+				if (!alreadyTracked) {
+					// This is an OAuth flow (Google login) - track success
+					trackLoginSuccess("google");
+				}
+				// Clear the flag for future logins
+				sessionStorage.removeItem("login_success_tracked");
+
+				// Store access token in localStorage using both methods for compatibility
 				localStorage.setItem(storageKey, token);
 				setBearerToken(token);
+
+				// Store refresh token if provided
+				if (refreshToken) {
+					setRefreshToken(refreshToken);
+				}
 
 				// Check if there's a saved redirect path from before the auth flow
 				const savedRedirectPath = getAndClearRedirectPath();
@@ -47,20 +67,17 @@ const TokenHandler = ({
 				const finalRedirectPath = savedRedirectPath || redirectPath;
 
 				// Redirect to the appropriate path
-				router.push(finalRedirectPath);
+				window.location.href = finalRedirectPath;
 			} catch (error) {
 				console.error("Error storing token in localStorage:", error);
 				// Even if there's an error, try to redirect to the default path
-				router.push(redirectPath);
+				window.location.href = redirectPath;
 			}
 		}
-	}, [searchParams, tokenParamName, storageKey, redirectPath, router]);
+	}, [searchParams, tokenParamName, storageKey, redirectPath]);
 
-	return (
-		<div className="flex items-center justify-center min-h-[200px]">
-			<p className="text-gray-500">Processing authentication...</p>
-		</div>
-	);
+	// Return null - the global provider handles the loading UI
+	return null;
 };
 
 export default TokenHandler;

@@ -1,58 +1,76 @@
 "use client";
 
+import { useAtomValue } from "jotai";
 import {
 	AlertCircle,
 	Bot,
-	Brain,
 	CheckCircle,
-	Loader2,
+	CircleDashed,
+	FileText,
+	ImageIcon,
 	RefreshCw,
 	RotateCcw,
 	Save,
-	Settings2,
-	Zap,
+	Shuffle,
 } from "lucide-react";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import {
+	globalImageGenConfigsAtom,
+	imageGenConfigsAtom,
+} from "@/atoms/image-gen-config/image-gen-config-query.atoms";
+import { updateLLMPreferencesMutationAtom } from "@/atoms/new-llm-config/new-llm-config-mutation.atoms";
+import {
+	globalNewLLMConfigsAtom,
+	llmPreferencesAtom,
+	newLLMConfigsAtom,
+} from "@/atoms/new-llm-config/new-llm-config-query.atoms";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import {
 	Select,
 	SelectContent,
+	SelectGroup,
 	SelectItem,
+	SelectLabel,
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { useGlobalLLMConfigs, useLLMConfigs, useLLMPreferences } from "@/hooks/use-llm-configs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { getProviderIcon } from "@/lib/provider-icons";
+import { cn } from "@/lib/utils";
 
 const ROLE_DESCRIPTIONS = {
-	long_context: {
-		icon: Brain,
-		title: "Long Context LLM",
-		description: "Handles summarization of long documents and complex Q&A",
-		color: "bg-blue-100 text-blue-800 border-blue-200",
-		examples: "Document analysis, research synthesis, complex Q&A",
-		characteristics: ["Large context window", "Deep reasoning", "Complex analysis"],
-	},
-	fast: {
-		icon: Zap,
-		title: "Fast LLM",
-		description: "Optimized for quick responses and real-time interactions",
-		color: "bg-green-100 text-green-800 border-green-200",
-		examples: "Quick searches, simple questions, instant responses",
-		characteristics: ["Low latency", "Quick responses", "Real-time chat"],
-	},
-	strategic: {
+	agent: {
 		icon: Bot,
-		title: "Strategic LLM",
-		description: "Advanced reasoning for planning and strategic decision making",
-		color: "bg-purple-100 text-purple-800 border-purple-200",
-		examples: "Planning workflows, strategic analysis, complex problem solving",
-		characteristics: ["Strategic thinking", "Long-term planning", "Complex reasoning"],
+		title: "Agent LLM",
+		description: "Primary LLM for chat interactions and agent operations",
+		color: "text-blue-600 dark:text-blue-400",
+		bgColor: "bg-blue-500/10",
+		prefKey: "agent_llm_id" as const,
+		configType: "llm" as const,
+	},
+	document_summary: {
+		icon: FileText,
+		title: "Document Summary LLM",
+		description: "Handles document summarization and research synthesis",
+		color: "text-purple-600 dark:text-purple-400",
+		bgColor: "bg-purple-500/10",
+		prefKey: "document_summary_llm_id" as const,
+		configType: "llm" as const,
+	},
+	image_generation: {
+		icon: ImageIcon,
+		title: "Image Generation Model",
+		description: "Model used for AI image generation (DALL-E, GPT Image, etc.)",
+		color: "text-teal-600 dark:text-teal-400",
+		bgColor: "bg-teal-500/10",
+		prefKey: "image_generation_config_id" as const,
+		configType: "image" as const,
 	},
 };
 
@@ -61,30 +79,44 @@ interface LLMRoleManagerProps {
 }
 
 export function LLMRoleManager({ searchSpaceId }: LLMRoleManagerProps) {
+	// LLM configs
 	const {
-		llmConfigs,
-		loading: configsLoading,
+		data: newLLMConfigs = [],
+		isFetching: configsLoading,
 		error: configsError,
-		refreshConfigs,
-	} = useLLMConfigs(searchSpaceId);
+		refetch: refreshConfigs,
+	} = useAtomValue(newLLMConfigsAtom);
 	const {
-		globalConfigs,
-		loading: globalConfigsLoading,
+		data: globalConfigs = [],
+		isFetching: globalConfigsLoading,
 		error: globalConfigsError,
-		refreshGlobalConfigs,
-	} = useGlobalLLMConfigs();
+	} = useAtomValue(globalNewLLMConfigsAtom);
+
+	// Image gen configs
 	const {
-		preferences,
-		loading: preferencesLoading,
+		data: userImageConfigs = [],
+		isFetching: imageConfigsLoading,
+		error: imageConfigsError,
+	} = useAtomValue(imageGenConfigsAtom);
+	const {
+		data: globalImageConfigs = [],
+		isFetching: globalImageConfigsLoading,
+		error: globalImageConfigsError,
+	} = useAtomValue(globalImageGenConfigsAtom);
+
+	// Preferences
+	const {
+		data: preferences = {},
+		isFetching: preferencesLoading,
 		error: preferencesError,
-		updatePreferences,
-		refreshPreferences,
-	} = useLLMPreferences(searchSpaceId);
+	} = useAtomValue(llmPreferencesAtom);
+
+	const { mutateAsync: updatePreferences } = useAtomValue(updateLLMPreferencesMutationAtom);
 
 	const [assignments, setAssignments] = useState({
-		long_context_llm_id: preferences.long_context_llm_id || "",
-		fast_llm_id: preferences.fast_llm_id || "",
-		strategic_llm_id: preferences.strategic_llm_id || "",
+		agent_llm_id: preferences.agent_llm_id ?? "",
+		document_summary_llm_id: preferences.document_summary_llm_id ?? "",
+		image_generation_config_id: preferences.image_generation_config_id ?? "",
 	});
 
 	const [hasChanges, setHasChanges] = useState(false);
@@ -92,27 +124,26 @@ export function LLMRoleManager({ searchSpaceId }: LLMRoleManagerProps) {
 
 	useEffect(() => {
 		const newAssignments = {
-			long_context_llm_id: preferences.long_context_llm_id || "",
-			fast_llm_id: preferences.fast_llm_id || "",
-			strategic_llm_id: preferences.strategic_llm_id || "",
+			agent_llm_id: preferences.agent_llm_id ?? "",
+			document_summary_llm_id: preferences.document_summary_llm_id ?? "",
+			image_generation_config_id: preferences.image_generation_config_id ?? "",
 		};
 		setAssignments(newAssignments);
 		setHasChanges(false);
 	}, [preferences]);
 
-	const handleRoleAssignment = (role: string, configId: string) => {
+	const handleRoleAssignment = (prefKey: string, configId: string) => {
 		const newAssignments = {
 			...assignments,
-			[role]: configId === "unassigned" ? "" : parseInt(configId),
+			[prefKey]: configId === "unassigned" ? "" : parseInt(configId),
 		};
 
 		setAssignments(newAssignments);
 
-		// Check if there are changes compared to current preferences
 		const currentPrefs = {
-			long_context_llm_id: preferences.long_context_llm_id || "",
-			fast_llm_id: preferences.fast_llm_id || "",
-			strategic_llm_id: preferences.strategic_llm_id || "",
+			agent_llm_id: preferences.agent_llm_id ?? "",
+			document_summary_llm_id: preferences.document_summary_llm_id ?? "",
+			image_generation_config_id: preferences.image_generation_config_id ?? "",
 		};
 
 		const hasChangesNow = Object.keys(newAssignments).some(
@@ -127,443 +158,431 @@ export function LLMRoleManager({ searchSpaceId }: LLMRoleManagerProps) {
 	const handleSave = async () => {
 		setIsSaving(true);
 
+		const toNumericOrUndefined = (val: string | number) =>
+			typeof val === "string" ? (val ? parseInt(val) : undefined) : val;
+
 		const numericAssignments = {
-			long_context_llm_id:
-				typeof assignments.long_context_llm_id === "string"
-					? assignments.long_context_llm_id
-						? parseInt(assignments.long_context_llm_id)
-						: undefined
-					: assignments.long_context_llm_id,
-			fast_llm_id:
-				typeof assignments.fast_llm_id === "string"
-					? assignments.fast_llm_id
-						? parseInt(assignments.fast_llm_id)
-						: undefined
-					: assignments.fast_llm_id,
-			strategic_llm_id:
-				typeof assignments.strategic_llm_id === "string"
-					? assignments.strategic_llm_id
-						? parseInt(assignments.strategic_llm_id)
-						: undefined
-					: assignments.strategic_llm_id,
+			agent_llm_id: toNumericOrUndefined(assignments.agent_llm_id),
+			document_summary_llm_id: toNumericOrUndefined(assignments.document_summary_llm_id),
+			image_generation_config_id: toNumericOrUndefined(assignments.image_generation_config_id),
 		};
 
-		const success = await updatePreferences(numericAssignments);
+		await updatePreferences({
+			search_space_id: searchSpaceId,
+			data: numericAssignments,
+		});
 
-		if (success) {
-			setHasChanges(false);
-			toast.success("LLM role assignments saved successfully!");
-		}
+		setHasChanges(false);
+		toast.success("Role assignments saved successfully!");
 
 		setIsSaving(false);
 	};
 
 	const handleReset = () => {
 		setAssignments({
-			long_context_llm_id: preferences.long_context_llm_id || "",
-			fast_llm_id: preferences.fast_llm_id || "",
-			strategic_llm_id: preferences.strategic_llm_id || "",
+			agent_llm_id: preferences.agent_llm_id ?? "",
+			document_summary_llm_id: preferences.document_summary_llm_id ?? "",
+			image_generation_config_id: preferences.image_generation_config_id ?? "",
 		});
 		setHasChanges(false);
 	};
 
 	const isAssignmentComplete =
-		assignments.long_context_llm_id && assignments.fast_llm_id && assignments.strategic_llm_id;
-	const assignedConfigIds = Object.values(assignments).filter((id) => id !== "");
+		assignments.agent_llm_id !== "" &&
+		assignments.agent_llm_id !== null &&
+		assignments.agent_llm_id !== undefined &&
+		assignments.document_summary_llm_id !== "" &&
+		assignments.document_summary_llm_id !== null &&
+		assignments.document_summary_llm_id !== undefined &&
+		assignments.image_generation_config_id !== "" &&
+		assignments.image_generation_config_id !== null &&
+		assignments.image_generation_config_id !== undefined;
 
-	// Combine global and custom configs
-	const allConfigs = [
+	// Combine global and custom LLM configs
+	const allLLMConfigs = [
 		...globalConfigs.map((config) => ({ ...config, is_global: true })),
-		...llmConfigs.filter((config) => config.id && config.id.toString().trim() !== ""),
+		...newLLMConfigs.filter((config) => config.id && config.id.toString().trim() !== ""),
 	];
 
-	const availableConfigs = allConfigs;
+	// Combine global and custom image gen configs
+	const allImageConfigs = [
+		...globalImageConfigs.map((config) => ({ ...config, is_global: true })),
+		...(userImageConfigs ?? []).filter((config) => config.id && config.id.toString().trim() !== ""),
+	];
 
-	const isLoading = configsLoading || preferencesLoading || globalConfigsLoading;
-	const hasError = configsError || preferencesError || globalConfigsError;
+	const isLoading =
+		configsLoading ||
+		preferencesLoading ||
+		globalConfigsLoading ||
+		imageConfigsLoading ||
+		globalImageConfigsLoading;
+	const hasError =
+		configsError ||
+		preferencesError ||
+		globalConfigsError ||
+		imageConfigsError ||
+		globalImageConfigsError;
+	const hasAnyConfigs = allLLMConfigs.length > 0 || allImageConfigs.length > 0;
 
 	return (
-		<div className="space-y-6">
-			{/* Header */}
-			<div className="flex flex-col space-y-4 lg:flex-row lg:items-center lg:justify-between lg:space-y-0">
-				<div className="space-y-1">
-					<div className="flex items-center space-x-3">
-						<div className="flex h-10 w-10 items-center justify-center rounded-lg bg-purple-500/10">
-							<Settings2 className="h-5 w-5 text-purple-600" />
-						</div>
-						<div>
-							<h2 className="text-2xl font-bold tracking-tight">LLM Role Management</h2>
-							<p className="text-muted-foreground">
-								Assign your LLM configurations to specific roles for different purposes.
-							</p>
-						</div>
-					</div>
-				</div>
-				<div className="flex flex-wrap gap-2">
-					<Button
+		<div className="space-y-5 md:space-y-6">
+			{/* Header actions */}
+			<div className="flex items-center justify-between">
+				<Button
+					variant="outline"
+					size="sm"
+					onClick={() => refreshConfigs()}
+					disabled={isLoading}
+					className="flex items-center gap-2 text-xs md:text-sm h-8 md:h-9"
+				>
+					<RefreshCw className="h-3 w-3 md:h-4 md:w-4" />
+					Refresh
+				</Button>
+				{isAssignmentComplete && !isLoading && !hasError && (
+					<Badge
 						variant="outline"
-						size="sm"
-						onClick={refreshConfigs}
-						disabled={isLoading}
-						className="flex items-center gap-2"
+						className="text-xs gap-1.5 border-emerald-500/30 text-emerald-700 dark:text-emerald-300 bg-emerald-500/5"
 					>
-						<RefreshCw className={`h-4 w-4 ${configsLoading ? "animate-spin" : ""}`} />
-						<span className="hidden sm:inline">Refresh Configs</span>
-						<span className="sm:hidden">Configs</span>
-					</Button>
-					<Button
-						variant="outline"
-						size="sm"
-						onClick={refreshPreferences}
-						disabled={isLoading}
-						className="flex items-center gap-2"
-					>
-						<RefreshCw className={`h-4 w-4 ${preferencesLoading ? "animate-spin" : ""}`} />
-						<span className="hidden sm:inline">Refresh Preferences</span>
-						<span className="sm:hidden">Prefs</span>
-					</Button>
-				</div>
+						<CheckCircle className="h-3 w-3" />
+						All roles assigned
+					</Badge>
+				)}
 			</div>
 
 			{/* Error Alert */}
-			{hasError && (
-				<Alert variant="destructive">
-					<AlertCircle className="h-4 w-4" />
-					<AlertDescription>
-						{configsError || preferencesError || globalConfigsError}
+			<AnimatePresence>
+				{hasError && (
+					<motion.div
+						key="error-alert"
+						initial={{ opacity: 0, y: -10 }}
+						animate={{ opacity: 1, y: 0 }}
+						exit={{ opacity: 0, y: -10 }}
+					>
+						<Alert variant="destructive" className="py-3 md:py-4">
+							<AlertCircle className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+							<AlertDescription className="text-xs md:text-sm">
+								{(configsError?.message ?? "Failed to load LLM configurations") ||
+									(preferencesError?.message ?? "Failed to load preferences") ||
+									(globalConfigsError?.message ?? "Failed to load global configurations")}
+							</AlertDescription>
+						</Alert>
+					</motion.div>
+				)}
+			</AnimatePresence>
+
+			{/* Loading Skeleton */}
+			{isLoading && (
+				<div className="grid gap-4 grid-cols-1 lg:grid-cols-2">
+					{["skeleton-a", "skeleton-b", "skeleton-c"].map((key) => (
+						<Card key={key} className="border-border/60">
+							<CardContent className="p-4 md:p-5 space-y-4">
+								{/* Header: icon + title + status */}
+								<div className="flex items-start justify-between gap-3">
+									<div className="flex items-center gap-3 min-w-0">
+										<Skeleton className="h-9 w-9 rounded-lg shrink-0" />
+										<div className="space-y-1.5 flex-1">
+											<Skeleton className="h-4 w-24 md:w-28" />
+											<Skeleton className="h-3 w-40 md:w-52" />
+										</div>
+									</div>
+									<Skeleton className="h-4 w-4 rounded-full shrink-0" />
+								</div>
+								{/* Label */}
+								<div className="space-y-1.5">
+									<Skeleton className="h-3 w-20" />
+									<Skeleton className="h-9 md:h-10 w-full rounded-md" />
+								</div>
+								{/* Summary block */}
+								<div className="rounded-lg border border-border/50 p-3 space-y-2">
+									<div className="flex items-center gap-2">
+										<Skeleton className="h-3.5 w-3.5 rounded shrink-0" />
+										<Skeleton className="h-3.5 w-28" />
+									</div>
+									<div className="flex items-center gap-1.5">
+										<Skeleton className="h-4 w-14 rounded-full" />
+										<Skeleton className="h-3 w-24" />
+									</div>
+								</div>
+							</CardContent>
+						</Card>
+					))}
+				</div>
+			)}
+
+			{/* No configs warning */}
+			{!isLoading && !hasError && !hasAnyConfigs && (
+				<Alert variant="destructive" className="py-3 md:py-4">
+					<AlertCircle className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+					<AlertDescription className="text-xs md:text-sm">
+						No configurations found. Please add at least one LLM provider or image model in the
+						respective settings tabs before assigning roles.
 					</AlertDescription>
 				</Alert>
 			)}
 
-			{/* Loading State */}
-			{isLoading && (
-				<Card>
-					<CardContent className="flex items-center justify-center py-12">
-						<div className="flex items-center gap-2 text-muted-foreground">
-							<Loader2 className="w-5 h-5 animate-spin" />
-							<span>
-								{configsLoading && preferencesLoading
-									? "Loading configurations and preferences..."
-									: configsLoading
-										? "Loading configurations..."
-										: "Loading preferences..."}
-							</span>
-						</div>
-					</CardContent>
-				</Card>
-			)}
+			{/* Role Assignment Cards */}
+			{!isLoading && !hasError && hasAnyConfigs && (
+				<motion.div
+					initial={{ opacity: 0 }}
+					animate={{ opacity: 1 }}
+					transition={{ duration: 0.3 }}
+					className="grid gap-4 grid-cols-1 lg:grid-cols-2"
+				>
+					{Object.entries(ROLE_DESCRIPTIONS).map(([key, role], index) => {
+						const IconComponent = role.icon;
+						const isImageRole = role.configType === "image";
+						const currentAssignment = assignments[role.prefKey as keyof typeof assignments];
 
-			{/* Stats Overview */}
-			{!isLoading && !hasError && (
-				<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-					<Card className="border-l-4 border-l-blue-500">
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight">{availableConfigs.length}</p>
-									<p className="text-sm font-medium text-muted-foreground">Available Models</p>
-									<div className="flex gap-2 text-xs text-muted-foreground">
-										<span>🌐 {globalConfigs.length} Global</span>
-										<span>• {llmConfigs.length} Custom</span>
-									</div>
-								</div>
-								<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-blue-500/10">
-									<Bot className="h-6 w-6 text-blue-600" />
-								</div>
-							</div>
-						</CardContent>
-					</Card>
+						// Pick the right config lists based on role type
+						const roleGlobalConfigs = isImageRole ? globalImageConfigs : globalConfigs;
+						const roleUserConfigs = isImageRole
+							? (userImageConfigs ?? []).filter((c) => c.id && c.id.toString().trim() !== "")
+							: newLLMConfigs.filter((c) => c.id && c.id.toString().trim() !== "");
+						const roleAllConfigs = isImageRole ? allImageConfigs : allLLMConfigs;
 
-					<Card className="border-l-4 border-l-purple-500">
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight">{assignedConfigIds.length}</p>
-									<p className="text-sm font-medium text-muted-foreground">Assigned Roles</p>
-								</div>
-								<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-purple-500/10">
-									<CheckCircle className="h-6 w-6 text-purple-600" />
-								</div>
-							</div>
-						</CardContent>
-					</Card>
+						const assignedConfig = roleAllConfigs.find((config) => config.id === currentAssignment);
+						const isAssigned =
+							currentAssignment !== "" &&
+							currentAssignment !== null &&
+							currentAssignment !== undefined;
+						const isAutoMode =
+							assignedConfig && "is_auto_mode" in assignedConfig && assignedConfig.is_auto_mode;
 
-					<Card
-						className={`border-l-4 ${
-							isAssignmentComplete ? "border-l-green-500" : "border-l-yellow-500"
-						}`}
-					>
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p className="text-3xl font-bold tracking-tight">
-										{Math.round((assignedConfigIds.length / 3) * 100)}%
-									</p>
-									<p className="text-sm font-medium text-muted-foreground">Completion</p>
-								</div>
-								<div
-									className={`flex h-12 w-12 items-center justify-center rounded-lg ${
-										isAssignmentComplete ? "bg-green-500/10" : "bg-yellow-500/10"
-									}`}
-								>
-									{isAssignmentComplete ? (
-										<CheckCircle className="h-6 w-6 text-green-600" />
-									) : (
-										<AlertCircle className="h-6 w-6 text-yellow-600" />
-									)}
-								</div>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card
-						className={`border-l-4 ${
-							isAssignmentComplete ? "border-l-emerald-500" : "border-l-orange-500"
-						}`}
-					>
-						<CardContent className="p-6">
-							<div className="flex items-center justify-between space-x-4">
-								<div className="space-y-1">
-									<p
-										className={`text-3xl font-bold tracking-tight ${
-											isAssignmentComplete ? "text-emerald-600" : "text-orange-600"
-										}`}
-									>
-										{isAssignmentComplete ? "Ready" : "Setup"}
-									</p>
-									<p className="text-sm font-medium text-muted-foreground">Status</p>
-								</div>
-								<div
-									className={`flex h-12 w-12 items-center justify-center rounded-lg ${
-										isAssignmentComplete ? "bg-emerald-500/10" : "bg-orange-500/10"
-									}`}
-								>
-									{isAssignmentComplete ? (
-										<CheckCircle className="h-6 w-6 text-emerald-600" />
-									) : (
-										<RefreshCw className="h-6 w-6 text-orange-600" />
-									)}
-								</div>
-							</div>
-						</CardContent>
-					</Card>
-				</div>
-			)}
-
-			{/* Info Alert */}
-			{!isLoading && !hasError && (
-				<div className="space-y-6">
-					{availableConfigs.length === 0 ? (
-						<Alert variant="destructive">
-							<AlertCircle className="h-4 w-4" />
-							<AlertDescription>
-								No LLM configurations found. Please add at least one LLM provider in the Model
-								Configs tab before assigning roles.
-							</AlertDescription>
-						</Alert>
-					) : !isAssignmentComplete ? (
-						<Alert>
-							<AlertCircle className="h-4 w-4" />
-							<AlertDescription>
-								Complete all role assignments to enable full functionality. Each role serves
-								different purposes in your workflow.
-							</AlertDescription>
-						</Alert>
-					) : (
-						<Alert>
-							<CheckCircle className="h-4 w-4" />
-							<AlertDescription>
-								All roles are assigned and ready to use! Your LLM configuration is complete.
-							</AlertDescription>
-						</Alert>
-					)}
-
-					{/* Role Assignment Cards */}
-					{availableConfigs.length > 0 && (
-						<div className="grid gap-6">
-							{Object.entries(ROLE_DESCRIPTIONS).map(([key, role]) => {
-								const IconComponent = role.icon;
-								const currentAssignment = assignments[`${key}_llm_id` as keyof typeof assignments];
-								const assignedConfig = availableConfigs.find(
-									(config) => config.id === currentAssignment
-								);
-
-								return (
-									<motion.div
-										key={key}
-										initial={{ opacity: 0, y: 10 }}
-										animate={{ opacity: 1, y: 0 }}
-										transition={{ delay: Object.keys(ROLE_DESCRIPTIONS).indexOf(key) * 0.1 }}
-									>
-										<Card
-											className={`border-l-4 ${currentAssignment ? "border-l-primary" : "border-l-muted"} hover:shadow-md transition-shadow`}
-										>
-											<CardHeader className="pb-3">
-												<div className="flex items-center justify-between">
-													<div className="flex items-center gap-3">
-														<div className={`p-2 rounded-lg ${role.color}`}>
-															<IconComponent className="w-5 h-5" />
-														</div>
-														<div>
-															<CardTitle className="text-lg">{role.title}</CardTitle>
-															<CardDescription className="mt-1">{role.description}</CardDescription>
-														</div>
-													</div>
-													{currentAssignment && <CheckCircle className="w-5 h-5 text-green-500" />}
+						return (
+							<motion.div
+								key={key}
+								initial={{ opacity: 0, y: 15 }}
+								animate={{ opacity: 1, y: 0 }}
+								transition={{ delay: index * 0.08, duration: 0.3 }}
+							>
+								<Card className="group relative overflow-hidden transition-all duration-200 border-border/60 hover:shadow-md h-full">
+									<CardContent className="p-4 md:p-5 space-y-4">
+										{/* Role Header */}
+										<div className="flex items-start justify-between gap-3">
+											<div className="flex items-center gap-3 min-w-0">
+												<div
+													className={cn(
+														"flex items-center justify-center w-9 h-9 rounded-lg shrink-0",
+														role.bgColor
+													)}
+												>
+													<IconComponent className={cn("w-4 h-4", role.color)} />
 												</div>
-											</CardHeader>
-											<CardContent className="space-y-4">
-												<div className="space-y-2">
-													<Label className="text-sm font-medium">Assign LLM Configuration:</Label>
-													<Select
-														value={currentAssignment?.toString() || "unassigned"}
-														onValueChange={(value) => handleRoleAssignment(`${key}_llm_id`, value)}
-													>
-														<SelectTrigger>
-															<SelectValue placeholder="Select an LLM configuration" />
-														</SelectTrigger>
-														<SelectContent>
-															<SelectItem value="unassigned">
-																<span className="text-muted-foreground">Unassigned</span>
-															</SelectItem>
+												<div className="min-w-0">
+													<h4 className="text-sm font-semibold tracking-tight">{role.title}</h4>
+													<p className="text-[11px] text-muted-foreground/70 mt-0.5">
+														{role.description}
+													</p>
+												</div>
+											</div>
+											{isAssigned ? (
+												<CheckCircle className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+											) : (
+												<CircleDashed className="w-4 h-4 text-muted-foreground/40 shrink-0 mt-0.5" />
+											)}
+										</div>
 
-															{/* Global Configurations */}
-															{globalConfigs.length > 0 && (
-																<>
-																	<div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">
-																		Global Configurations
-																	</div>
-																	{globalConfigs.map((config) => (
-																		<SelectItem key={config.id} value={config.id.toString()}>
-																			<div className="flex items-center gap-2">
-																				<Badge variant="outline" className="text-xs">
-																					{config.provider}
+										{/* Selector */}
+										<div className="space-y-1.5">
+											<Label className="text-xs font-medium text-muted-foreground">
+												Configuration
+											</Label>
+											<Select
+												value={currentAssignment?.toString() || "unassigned"}
+												onValueChange={(value) => handleRoleAssignment(role.prefKey, value)}
+											>
+												<SelectTrigger className="w-full h-9 md:h-10 text-xs md:text-sm">
+													<SelectValue placeholder="Select a configuration" />
+												</SelectTrigger>
+												<SelectContent className="max-w-[calc(100vw-2rem)]">
+													<SelectItem
+														value="unassigned"
+														className="text-xs md:text-sm py-1.5 md:py-2"
+													>
+														<span className="text-muted-foreground">Unassigned</span>
+													</SelectItem>
+
+													{/* Global Configurations */}
+													{roleGlobalConfigs.length > 0 && (
+														<SelectGroup>
+															<SelectLabel className="text-[11px] md:text-xs font-semibold text-muted-foreground px-2 py-1 md:py-1.5">
+																Global Configurations
+															</SelectLabel>
+															{roleGlobalConfigs.map((config) => {
+																const isAuto = "is_auto_mode" in config && config.is_auto_mode;
+																return (
+																	<SelectItem
+																		key={config.id}
+																		value={config.id.toString()}
+																		className="text-xs md:text-sm py-1.5 md:py-2"
+																	>
+																		<div className="flex items-center gap-1 md:gap-1.5 flex-wrap min-w-0">
+																			{isAuto ? (
+																				<Badge
+																					variant="outline"
+																					className="text-[9px] md:text-[10px] shrink-0 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300 border-violet-200 dark:border-violet-700"
+																				>
+																					<Shuffle className="size-2 md:size-2.5 mr-0.5" />
+																					AUTO
 																				</Badge>
-																				<span>{config.name}</span>
-																				<span className="text-muted-foreground">
+																			) : (
+																				getProviderIcon(config.provider, {
+																					className: "size-3 md:size-3.5 shrink-0",
+																				})
+																			)}
+																			<span className="truncate text-xs md:text-sm">
+																				{config.name}
+																			</span>
+																			{!isAuto && (
+																				<span className="text-muted-foreground text-[10px] md:text-[11px] truncate">
 																					({config.model_name})
 																				</span>
-																				<Badge variant="secondary" className="text-xs">
-																					🌐 Global
+																			)}
+																			{isAuto && (
+																				<Badge
+																					variant="secondary"
+																					className="text-[8px] md:text-[9px] shrink-0 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300"
+																				>
+																					Recommended
 																				</Badge>
-																			</div>
-																		</SelectItem>
-																	))}
-																</>
-															)}
+																			)}
+																		</div>
+																	</SelectItem>
+																);
+															})}
+														</SelectGroup>
+													)}
 
-															{/* Custom Configurations */}
-															{llmConfigs.length > 0 && (
-																<>
-																	<div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">
-																		Your Configurations
+													{/* Custom Configurations */}
+													{roleUserConfigs.length > 0 && (
+														<SelectGroup>
+															<SelectLabel className="text-[11px] md:text-xs font-semibold text-muted-foreground px-2 py-1 md:py-1.5">
+																Your Configurations
+															</SelectLabel>
+															{roleUserConfigs.map((config) => (
+																<SelectItem
+																	key={config.id}
+																	value={config.id.toString()}
+																	className="text-xs md:text-sm py-1.5 md:py-2"
+																>
+																	<div className="flex items-center gap-1 md:gap-1.5 flex-wrap min-w-0">
+																		{getProviderIcon(config.provider, {
+																			className: "size-3 md:size-3.5 shrink-0",
+																		})}
+																		<span className="truncate text-xs md:text-sm">
+																			{config.name}
+																		</span>
+																		<span className="text-muted-foreground text-[10px] md:text-[11px] truncate">
+																			({config.model_name})
+																		</span>
 																	</div>
-																	{llmConfigs
-																		.filter(
-																			(config) => config.id && config.id.toString().trim() !== ""
-																		)
-																		.map((config) => (
-																			<SelectItem key={config.id} value={config.id.toString()}>
-																				<div className="flex items-center gap-2">
-																					<Badge variant="outline" className="text-xs">
-																						{config.provider}
-																					</Badge>
-																					<span>{config.name}</span>
-																					<span className="text-muted-foreground">
-																						({config.model_name})
-																					</span>
-																				</div>
-																			</SelectItem>
-																		))}
-																</>
-															)}
-														</SelectContent>
-													</Select>
-												</div>
+																</SelectItem>
+															))}
+														</SelectGroup>
+													)}
+												</SelectContent>
+											</Select>
+										</div>
 
-												{assignedConfig && (
-													<div className="mt-3 p-3 bg-muted/50 rounded-lg">
-														<div className="flex items-center gap-2 text-sm flex-wrap">
-															<Bot className="w-4 h-4" />
-															<span className="font-medium">Assigned:</span>
-															<Badge variant="secondary">{assignedConfig.provider}</Badge>
-															<span>{assignedConfig.name}</span>
-															{assignedConfig.is_global && (
-																<Badge variant="outline" className="text-xs">
-																	🌐 Global
-																</Badge>
+										{/* Assigned Config Summary */}
+										{assignedConfig && (
+											<div
+												className={cn(
+													"rounded-lg p-3 border",
+													isAutoMode
+														? "bg-violet-50 dark:bg-violet-900/10 border-violet-200/50 dark:border-violet-800/30"
+														: "bg-muted/40 border-border/50"
+												)}
+											>
+												{isAutoMode ? (
+													<div className="flex items-center gap-2">
+														<Shuffle
+															className={cn(
+																"w-3.5 h-3.5 shrink-0 text-violet-600 dark:text-violet-400"
+															)}
+														/>
+														<div className="min-w-0">
+															<p className="text-xs font-medium text-violet-700 dark:text-violet-300">
+																Auto Mode
+															</p>
+															<p className="text-[10px] text-violet-600/70 dark:text-violet-400/70 mt-0.5">
+																Routes across all available providers
+															</p>
+														</div>
+													</div>
+												) : (
+													<div className="flex items-start gap-2">
+														<IconComponent className="w-3.5 h-3.5 shrink-0 mt-0.5 text-muted-foreground" />
+														<div className="min-w-0 flex-1">
+															<div className="flex items-center gap-1.5 flex-wrap">
+																<span className="text-xs font-medium">{assignedConfig.name}</span>
+																{"is_global" in assignedConfig && assignedConfig.is_global && (
+																	<Badge variant="secondary" className="text-[9px] px-1.5 py-0">
+																		🌐 Global
+																	</Badge>
+																)}
+															</div>
+															<div className="flex items-center gap-1.5 mt-1">
+																{getProviderIcon(assignedConfig.provider, {
+																	className: "size-3 shrink-0",
+																})}
+																<code className="text-[10px] text-muted-foreground font-mono truncate">
+																	{assignedConfig.model_name}
+																</code>
+															</div>
+															{assignedConfig.api_base && (
+																<p className="text-[10px] text-muted-foreground/60 mt-1 truncate">
+																	{assignedConfig.api_base}
+																</p>
 															)}
 														</div>
-														<div className="text-xs text-muted-foreground mt-1">
-															Model: {assignedConfig.model_name}
-														</div>
-														{assignedConfig.api_base && (
-															<div className="text-xs text-muted-foreground">
-																Base: {assignedConfig.api_base}
-															</div>
-														)}
 													</div>
 												)}
-											</CardContent>
-										</Card>
-									</motion.div>
-								);
-							})}
-						</div>
-					)}
+											</div>
+										)}
+									</CardContent>
+								</Card>
+							</motion.div>
+						);
+					})}
+				</motion.div>
+			)}
 
-					{/* Action Buttons */}
-					{hasChanges && (
-						<div className="flex justify-center gap-3 pt-4">
-							<Button onClick={handleSave} disabled={isSaving} className="flex items-center gap-2">
-								<Save className="w-4 h-4" />
-								{isSaving ? "Saving..." : "Save Changes"}
-							</Button>
+			{/* Save / Reset Bar */}
+			<AnimatePresence>
+				{hasChanges && (
+					<motion.div
+						initial={{ opacity: 0, y: 10 }}
+						animate={{ opacity: 1, y: 0 }}
+						exit={{ opacity: 0, y: 10 }}
+						transition={{ duration: 0.2 }}
+						className="flex items-center justify-between gap-3 rounded-lg border border-border bg-muted/50 p-3 md:p-4"
+					>
+						<p className="text-xs md:text-sm text-muted-foreground">You have unsaved changes</p>
+						<div className="flex items-center gap-2">
 							<Button
 								variant="outline"
+								size="sm"
 								onClick={handleReset}
 								disabled={isSaving}
-								className="flex items-center gap-2"
+								className="h-8 text-xs gap-1.5"
 							>
-								<RotateCcw className="w-4 h-4" />
+								<RotateCcw className="w-3 h-3" />
 								Reset
 							</Button>
+							<Button
+								size="sm"
+								onClick={handleSave}
+								disabled={isSaving}
+								className="h-8 text-xs gap-1.5"
+							>
+								<Save className="w-3 h-3" />
+								{isSaving ? "Saving…" : "Save Changes"}
+							</Button>
 						</div>
-					)}
-
-					{/* Status Indicator */}
-					{isAssignmentComplete && !hasChanges && (
-						<div className="flex justify-center pt-4">
-							<div className="flex items-center gap-2 px-4 py-2 bg-green-50 text-green-700 rounded-lg border border-green-200">
-								<CheckCircle className="w-4 h-4" />
-								<span className="text-sm font-medium">All roles assigned and saved!</span>
-							</div>
-						</div>
-					)}
-
-					{/* Progress Indicator */}
-					<div className="flex justify-center">
-						<div className="flex items-center gap-2 text-sm text-muted-foreground">
-							<span>Progress:</span>
-							<div className="flex gap-1">
-								{Object.keys(ROLE_DESCRIPTIONS).map((key) => (
-									<div
-										key={key}
-										className={`w-2 h-2 rounded-full ${
-											assignments[`${key}_llm_id` as keyof typeof assignments]
-												? "bg-primary"
-												: "bg-muted"
-										}`}
-									/>
-								))}
-							</div>
-							<span>
-								{assignedConfigIds.length} of {Object.keys(ROLE_DESCRIPTIONS).length} roles assigned
-							</span>
-						</div>
-					</div>
-				</div>
-			)}
+					</motion.div>
+				)}
+			</AnimatePresence>
 		</div>
 	);
 }

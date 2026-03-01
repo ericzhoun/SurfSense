@@ -1,136 +1,148 @@
+<a href="https://www.surfsense.com/"><img width="1584" height="396" alt="readme_banner" src="https://github.com/user-attachments/assets/9361ef58-1753-4b6e-b275-5020d8847261" /></a>
 
-![new_header](https://github.com/user-attachments/assets/e236b764-0ddc-42ff-a1f1-8fbb3d2e0e65)
 
 
 <div align="center">
 <a href="https://discord.gg/ejRNvftDp9">
 <img src="https://img.shields.io/discord/1359368468260192417" alt="Discord">
 </a>
+<a href="https://www.reddit.com/r/SurfSense/">
+<img src="https://img.shields.io/reddit/subreddit-subscribers/SurfSense?style=social" alt="Reddit">
+</a>
 </div>
 
 <div align="center">
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [Español](README.es.md) | [Português](README.pt-BR.md) | [हिन्दी](README.hi.md) | [简体中文](README.zh-CN.md)
 
 </div>
-
-# SurfSense
-While tools like NotebookLM and Perplexity are impressive and highly effective for conducting research on any topic/query, SurfSense elevates this capability by integrating with your personal knowledge base. It is a highly customizable AI research agent, connected to external sources such as Search Engines (SearxNG, Tavily, LinkUp), Slack, Linear, Jira, ClickUp, Confluence, BookStack, Gmail, Notion, YouTube, GitHub, Discord, Airtable, Google Calendar, Luma, Elasticsearch and more to come.
-
 <div align="center">
 <a href="https://trendshift.io/repositories/13606" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13606" alt="MODSetter%2FSurfSense | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
 
+# SurfSense
+Connect any LLM to your internal knowledge sources and chat with it in real time alongside your team. OSS alternative to NotebookLM, Perplexity, and Glean.
+
+SurfSense is a highly customizable AI research agent, connected to external sources such as Search Engines (SearxNG, Tavily, LinkUp), Google Drive, Slack, Microsoft Teams, Linear, Jira, ClickUp, Confluence, BookStack, Gmail, Notion, YouTube, GitHub, Discord, Airtable, Google Calendar, Luma, Circleback, Elasticsearch, Obsidian and more to come.
+
+
 
 # Video 
 
-
-https://github.com/user-attachments/assets/d9221908-e0de-4b2f-ac3a-691cf4b202da
-
+https://github.com/user-attachments/assets/cc0c84d3-1f2f-4f7a-b519-2ecce22310b1
 
 ## Podcast Sample
 
 https://github.com/user-attachments/assets/a0a16566-6967-4374-ac51-9b3e07fbecd7
 
 
+## How to Use SurfSense
 
+### Cloud
+
+1. Go to [surfsense.com](https://www.surfsense.com) and login.
+
+<p align="center"><img src="https://github.com/user-attachments/assets/b4df25fe-db5a-43c2-9462-b75cf7f1b707" alt="Login" /></p>
+
+2. Connect your connectors and sync. Enable periodic syncing to keep connectors synced.
+
+<p align="center"><img src="https://github.com/user-attachments/assets/59da61d7-da05-4576-b7c0-dbc09f5985e8" alt="Connectors" /></p>
+
+3. Till connectors data index, upload Documents.
+
+<p align="center"><img src="https://github.com/user-attachments/assets/d1e8b2e2-9eac-41d8-bdc0-f0cdc405d128" alt="Upload Documents" /></p>
+
+4. Once everything is indexed, Ask Away (Use Cases):
+
+   - Basic search and citation
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/81e797a1-e01a-4003-8e60-0a0b3a9789df" alt="Search and Citation" /></p>
+
+   - Document Mention QNA
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/be958295-0a8c-4707-998c-9fe1f1c007be" alt="Document Mention QNA" /></p>
+
+   - Report Generations and Exports (PDF, DOCX for now)
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/9836b7d6-57c9-4951-b61c-68202c9b6ace" alt="Report Generation" /></p>
+
+   - Podcast Generations
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/58c9b057-8848-4e81-aaba-d2c617985d8c" alt="Podcast Generation" /></p>
+
+   - Image Generations
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/25f94cb3-18f8-4854-afd9-27b7bfd079cb" alt="Image Generation" /></p>
+
+   - And more coming soon.
+
+
+### Self Hosted
+
+Run SurfSense on your own infrastructure for full data control and privacy.
+
+**Quick Start (Docker one-liner):**
+
+```bash
+docker run -d -p 3000:3000 -p 8000:8000 -p 5133:5133 -v surfsense-data:/data --name surfsense --restart unless-stopped ghcr.io/modsetter/surfsense:latest
+```
+
+After starting, open [http://localhost:3000](http://localhost:3000) in your browser.
+
+**Update (Automatic updates with Watchtower):**
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock nickfedor/watchtower --run-once surfsense
+```
+
+For Docker Compose, manual installation, and other deployment options, check the [docs](https://www.surfsense.com/docs/).
+
+### How to Realtime Collaborate (Beta)
+
+1. Go to Manage Members page and create an invite.
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/40ed7683-5aa6-48a0-a3df-00575528c392" alt="Invite Members" /></p>
+
+2. Teammate joins and that SearchSpace becomes shared.
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/ea4e1057-4d2b-4fd2-9ca0-cd19286a285e" alt="Invite Join Flow" /></p>
+
+3. Make chat shared.
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/17b93904-0888-4c3a-ac12-51a24a8ea26a" alt="Make Chat Shared" /></p>
+
+4. Your team can now chat in realtime.
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/83803ac2-fbce-4d93-aae3-85eb85a3053a" alt="Realtime Chat" /></p>
+
+5. Add comment to tag teammates.
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/3b04477d-8f42-4baa-be95-867c1eaeba87" alt="Realtime Comments" /></p>
 
 ## Key Features
 
-### 💡 **Idea**: 
-- Have your own highly customizable private NotebookLM and Perplexity integrated with external sources.
-### 📁 **Multiple File Format Uploading Support**
-- Save content from your own personal files *(Documents, images, videos and supports **50+ file extensions**)* to your own personal knowledge base .
-### 🔍 **Powerful Search**
-- Quickly research or find anything in your saved content .
-### 💬 **Chat with your Saved Content**
-- Interact in Natural Language and get cited answers.
-### 📄 **Cited Answers**
-- Get Cited answers just like Perplexity.
-### 🔔 **Privacy & Local LLM Support**
-- Works Flawlessly with Ollama local LLMs.
-### 🏠 **Self Hostable**
-- Open source and easy to deploy locally.
-### 👥 **Team Collaboration with RBAC**
-- Role-Based Access Control for Search Spaces
-- Invite team members with customizable roles (Owner, Admin, Editor, Viewer)
-- Granular permissions for documents, chats, connectors, and settings
-- Share knowledge bases securely within your organization
-### 🎙️ Podcasts 
-- Blazingly fast podcast generation agent. (Creates a 3-minute podcast in under 20 seconds.)
-- Convert your chat conversations into engaging audio content
-- Support for local TTS providers (Kokoro TTS)
-- Support for multiple TTS providers (OpenAI, Azure, Google Vertex AI)
+| Feature | Description |
+|---------|-------------|
+| OSS Alternative | Drop in replacement for NotebookLM, Perplexity, and Glean with real time team collaboration |
+| 50+ File Formats | Upload documents, images, videos via LlamaCloud, Unstructured, or Docling (local) |
+| Hybrid Search | Semantic + Full Text Search with Hierarchical Indices and Reciprocal Rank Fusion |
+| Cited Answers | Chat with your knowledge base and get Perplexity style cited responses |
+| Deep Agent Architecture | Powered by [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview) planning, subagents, and file system access |
+| Universal LLM Support | 100+ LLMs, 6000+ embedding models, all major rerankers via OpenAI spec & LiteLLM |
+| Privacy First | Full local LLM support (vLLM, Ollama) your data stays yours |
+| Team Collaboration | RBAC with Owner / Admin / Editor / Viewer roles, real time chat & comment threads |
+| Podcast Generation | 3 min podcast in under 20 seconds; multiple TTS providers (OpenAI, Azure, Kokoro) |
+| Browser Extension | Cross browser extension to save any webpage, including auth protected pages |
+| 25+ Connectors | Search Engines, Google Drive, Slack, Teams, Jira, Notion, GitHub, Discord & [more](#external-sources) |
+| Self Hostable | Open source, Docker one liner or full Docker Compose for production |
 
-### 📊 **Advanced RAG Techniques**
-- Supports 100+ LLM's
-- Supports 6000+ Embedding Models.
-- Supports all major Rerankers (Pinecode, Cohere, Flashrank etc)
-- Uses Hierarchical Indices (2 tiered RAG setup).
-- Utilizes Hybrid Search (Semantic + Full Text Search combined with Reciprocal Rank Fusion).
+<details>
+<summary><b>Full list of External Sources</b></summary>
+<a id="external-sources"></a>
 
-### ℹ️ **External Sources**
-- Search Engines (Tavily, LinkUp)
-- SearxNG (self-hosted instances)
-- Slack
-- Linear
-- Jira
-- ClickUp
-- Confluence
-- BookStack
-- Notion
-- Gmail
-- Youtube Videos
-- GitHub
-- Discord
-- Airtable
-- Google Calendar
-- Luma
-- Elasticsearch
-- and more to come.....
+Search Engines (Tavily, LinkUp) · SearxNG · Google Drive · Slack · Microsoft Teams · Linear · Jira · ClickUp · Confluence · BookStack · Notion · Gmail · YouTube Videos · GitHub · Discord · Airtable · Google Calendar · Luma · Circleback · Elasticsearch · Obsidian, and more to come.
 
-## 📄 **Supported File Extensions**
-
-> **Note**: File format support depends on your ETL service configuration. LlamaCloud supports 50+ formats, Unstructured supports 34+ core formats, and Docling (core formats, local processing, privacy-focused, no API key).
-
-### Documents & Text
-**LlamaCloud**: `.pdf`, `.doc`, `.docx`, `.docm`, `.dot`, `.dotm`, `.rtf`, `.txt`, `.xml`, `.epub`, `.odt`, `.wpd`, `.pages`, `.key`, `.numbers`, `.602`, `.abw`, `.cgm`, `.cwk`, `.hwp`, `.lwp`, `.mw`, `.mcw`, `.pbd`, `.sda`, `.sdd`, `.sdp`, `.sdw`, `.sgl`, `.sti`, `.sxi`, `.sxw`, `.stw`, `.sxg`, `.uof`, `.uop`, `.uot`, `.vor`, `.wps`, `.zabw`
-
-**Unstructured**: `.doc`, `.docx`, `.odt`, `.rtf`, `.pdf`, `.xml`, `.txt`, `.md`, `.markdown`, `.rst`, `.html`, `.org`, `.epub`
-
-**Docling**: `.pdf`, `.docx`, `.html`, `.htm`, `.xhtml`, `.adoc`, `.asciidoc`
-
-### Presentations
-**LlamaCloud**: `.ppt`, `.pptx`, `.pptm`, `.pot`, `.potm`, `.potx`, `.odp`, `.key`
-
-**Unstructured**: `.ppt`, `.pptx`
-
-**Docling**: `.pptx`
-
-### Spreadsheets & Data
-**LlamaCloud**: `.xlsx`, `.xls`, `.xlsm`, `.xlsb`, `.xlw`, `.csv`, `.tsv`, `.ods`, `.fods`, `.numbers`, `.dbf`, `.123`, `.dif`, `.sylk`, `.slk`, `.prn`, `.et`, `.uos1`, `.uos2`, `.wk1`, `.wk2`, `.wk3`, `.wk4`, `.wks`, `.wq1`, `.wq2`, `.wb1`, `.wb2`, `.wb3`, `.qpw`, `.xlr`, `.eth`
-
-**Unstructured**: `.xls`, `.xlsx`, `.csv`, `.tsv`
-
-**Docling**: `.xlsx`, `.csv`
-
-### Images
-**LlamaCloud**: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.svg`, `.tiff`, `.webp`, `.html`, `.htm`, `.web`
-
-**Unstructured**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.heic`
-
-**Docling**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.tif`, `.webp`
-
-### Audio & Video *(Always Supported)*
-`.mp3`, `.mpga`, `.m4a`, `.wav`, `.mp4`, `.mpeg`, `.webm`
-
-### Email & Communication
-**Unstructured**: `.eml`, `.msg`, `.p7s`
-
-### 🔖 Cross Browser Extension
-- The SurfSense extension can be used to save any webpage you like.
-- Its main usecase is to save any webpages protected beyond authentication.
-
+</details>
 
 
 ## FEATURE REQUESTS AND FUTURE
@@ -140,218 +152,25 @@ https://github.com/user-attachments/assets/a0a16566-6967-4374-ac51-9b3e07fbecd7
 
 Join the [SurfSense Discord](https://discord.gg/ejRNvftDp9) and help shape the future of SurfSense!
 
-## 🚀 Roadmap
+## Roadmap
 
 Stay up to date with our development progress and upcoming features!  
 Check out our public roadmap and contribute your ideas or feedback:
 
-**View the Roadmap:** [SurfSense Roadmap on GitHub Projects](https://github.com/users/MODSetter/projects/2)
+**Roadmap Discussion:** [SurfSense 2026 Roadmap](https://github.com/MODSetter/SurfSense/discussions/565)
 
+**Kanban Board:** [SurfSense Project Board](https://github.com/users/MODSetter/projects/3)
 
-## How to get started?
 
-### Quick Start with Docker 🐳
+## Contribute
 
-> [!TIP]
-> For production deployments, use the full [Docker Compose setup](https://www.surfsense.com/docs/docker-installation) which offers more control and scalability.
+All contributions welcome, from stars and bug reports to backend improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
 
-**Linux/macOS:**
+Thanks to all our Surfers:
 
-```bash
-docker run -d -p 3000:3000 -p 8000:8000 \
-  -v surfsense-data:/data \
-  --name surfsense \
-  --restart unless-stopped \
-  ghcr.io/modsetter/surfsense:latest
-```
-
-**Windows (PowerShell):**
-
-```powershell
-docker run -d -p 3000:3000 -p 8000:8000 `
-  -v surfsense-data:/data `
-  --name surfsense `
-  --restart unless-stopped `
-  ghcr.io/modsetter/surfsense:latest
-```
-
-**With Custom Configuration (e.g., OpenAI Embeddings):**
-
-```bash
-docker run -d -p 3000:3000 -p 8000:8000 \
-  -v surfsense-data:/data \
-  -e EMBEDDING_MODEL=openai://text-embedding-ada-002 \
-  -e OPENAI_API_KEY=your_openai_api_key \
-  --name surfsense \
-  --restart unless-stopped \
-  ghcr.io/modsetter/surfsense:latest
-```
-
-After starting, access SurfSense at:
-- **Frontend**: [http://localhost:3000](http://localhost:3000)
-- **Backend API**: [http://localhost:8000](http://localhost:8000)
-- **API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-**Useful Commands:**
-
-```bash
-docker logs -f surfsense      # View logs
-docker stop surfsense         # Stop
-docker start surfsense        # Start
-docker rm surfsense           # Remove (data preserved in volume)
-```
-
-### Installation Options
-
-SurfSense provides multiple options to get started:
-
-1. **[SurfSense Cloud](https://www.surfsense.com/login)** - The easiest way to try SurfSense without any setup.
-   - No installation required
-   - Instant access to all features
-   - Perfect for getting started quickly
-
-2. **Quick Start Docker (Above)** - Single command to get SurfSense running locally.
-   - All-in-one image with PostgreSQL, Redis, and all services bundled
-   - Perfect for evaluation, development, and small deployments
-   - Data persisted via Docker volume
-
-3. **[Docker Compose (Production)](https://www.surfsense.com/docs/docker-installation)** - Full stack deployment with separate services.
-   - Includes pgAdmin for database management through a web UI
-   - Supports environment variable customization via `.env` file
-   - Flexible deployment options (full stack or core services only)
-   - Better for production with separate scaling of services
-
-4. **[Manual Installation](https://www.surfsense.com/docs/manual-installation)** - For users who prefer more control over their setup or need to customize their deployment.
-
-Docker and manual installation guides include detailed OS-specific instructions for Windows, macOS, and Linux.
-
-Before self-hosting installation, make sure to complete the [prerequisite setup steps](https://www.surfsense.com/docs/) including:
-- Auth setup (optional - defaults to LOCAL auth)
-- **File Processing ETL Service** (optional - defaults to Docling):
-  - Docling (default, local processing, no API key required, supports PDF, Office docs, images, HTML, CSV)
-  - Unstructured.io API key (supports 34+ formats)
-  - LlamaIndex API key (enhanced parsing, supports 50+ formats)
-- Other API keys as needed for your use case
-
-## Screenshots
-
-**Research Agent** 
-
-![updated_researcher](https://github.com/user-attachments/assets/e22c5d86-f511-4c72-8c50-feba0c1561b4)
-
-**Search Spaces** 
-
-![search_spaces](https://github.com/user-attachments/assets/e254c38c-f937-44b6-9e9d-770db583d099)
-
-**Manage Documents** 
-![documents](https://github.com/user-attachments/assets/7001e306-eb06-4009-89c6-8fadfdc3fc4d)
-
-**Podcast Agent** 
-![podcasts](https://github.com/user-attachments/assets/6cb82ffd-9e14-4172-bc79-67faf34c4c1c)
-
-
-**Agent Chat** 
-
-![git_chat](https://github.com/user-attachments/assets/bb352d52-1c6d-4020-926b-722d0b98b491)
-
-**Browser Extension**
-
-![ext1](https://github.com/user-attachments/assets/1f042b7a-6349-422b-94fb-d40d0df16c40)
-
-![ext2](https://github.com/user-attachments/assets/a9b9f1aa-2677-404d-b0a0-c1b2dddf24a7)
-
-
-## Tech Stack
-
-
- ### **BackEnd** 
-
--  **FastAPI**: Modern, fast web framework for building APIs with Python
-  
--  **PostgreSQL with pgvector**: Database with vector search capabilities for similarity searches
-
--  **SQLAlchemy**: SQL toolkit and ORM (Object-Relational Mapping) for database interactions
-
--  **Alembic**: A database migrations tool for SQLAlchemy.
-
--  **FastAPI Users**: Authentication and user management with JWT and OAuth support
-
--  **LangGraph**: Framework for developing AI-agents.
-  
--  **LangChain**: Framework for developing AI-powered applications.
-
--  **LLM Integration**: Integration with LLM models through LiteLLM
-
--  **Rerankers**: Advanced result ranking for improved search relevance
-
--  **Hybrid Search**: Combines vector similarity and full-text search for optimal results using Reciprocal Rank Fusion (RRF)
-
--  **Vector Embeddings**: Document and text embeddings for semantic search
-
--  **pgvector**: PostgreSQL extension for efficient vector similarity operations
-
--  **Redis**: In-memory data structure store used as message broker and result backend for Celery
-
--  **Celery**: Distributed task queue for handling asynchronous background jobs (document processing, podcast generation, etc.)
-
--  **Flower**: Real-time monitoring and administration tool for Celery task queues
-
--  **Chonkie**: Advanced document chunking and embedding library
- - Uses `AutoEmbeddings` for flexible embedding model selection
- -  `LateChunker` for optimized document chunking based on embedding model's max sequence length
-
-
-  
----
- ### **FrontEnd**
-
--  **Next.js 15.2.3**: React framework featuring App Router, server components, automatic code-splitting, and optimized rendering.
-
--  **React 19.0.0**: JavaScript library for building user interfaces.
-
--  **TypeScript**: Static type-checking for JavaScript, enhancing code quality and developer experience.
-- **Vercel AI SDK Kit UI Stream Protocol**: To create scalable chat UI.
-
--  **Tailwind CSS 4.x**: Utility-first CSS framework for building custom UI designs.
-
--  **Shadcn**: Headless components library.
-
--  **Lucide React**: Icon set implemented as React components.
-
--  **Framer Motion**: Animation library for React.
-
--  **Sonner**: Toast notification library.
-
--  **Geist**: Font family from Vercel.
-
--  **React Hook Form**: Form state management and validation.
-
--  **Zod**: TypeScript-first schema validation with static type inference.
-
--  **@hookform/resolvers**: Resolvers for using validation libraries with React Hook Form.
-
--  **@tanstack/react-table**: Headless UI for building powerful tables & datagrids.
-
-
- ### **DevOps**
-
--  **Docker**: Container platform for consistent deployment across environments
-  
--  **Docker Compose**: Tool for defining and running multi-container Docker applications
-
--  **pgAdmin**: Web-based PostgreSQL administration tool included in Docker setup
-
-
-### **Extension** 
- Manifest v3 on Plasmo
-
-
-## Contribute 
-
-Contributions are very welcome! A contribution can be as small as a ⭐ or even finding and creating issues.
-Fine-tuning the Backend is always desired.
-
-For detailed contribution guidelines, please see our [CONTRIBUTING.md](CONTRIBUTING.md) file.
+<a href="https://github.com/MODSetter/SurfSense/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=MODSetter/SurfSense" />
+</a>
 
 ## Star History
 

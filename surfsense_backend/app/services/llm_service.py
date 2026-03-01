@@ -7,32 +7,56 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.config import config
-from app.db import LLMConfig, SearchSpace
+from app.db import NewLLMConfig, SearchSpace
+from app.services.llm_router_service import (
+    AUTO_MODE_ID,
+    ChatLiteLLMRouter,
+    LLMRouterService,
+    get_auto_mode_llm,
+    is_auto_mode,
+)
 
 # Configure litellm to automatically drop unsupported parameters
 litellm.drop_params = True
+
+# Memory controls: prevent unbounded internal accumulation
+litellm.telemetry = False
+litellm.cache = None
+litellm.success_callback = []
+litellm.failure_callback = []
+litellm.input_callback = []
 
 logger = logging.getLogger(__name__)
 
 
 class LLMRole:
-    LONG_CONTEXT = "long_context"
-    FAST = "fast"
-    STRATEGIC = "strategic"
+    AGENT = "agent"  # For agent/chat operations
+    DOCUMENT_SUMMARY = "document_summary"  # For document summarization
 
 
 def get_global_llm_config(llm_config_id: int) -> dict | None:
     """
     Get a global LLM configuration by ID.
-    Global configs have negative IDs.
+    Global configs have negative IDs. ID 0 is reserved for Auto mode.
 
     Args:
-        llm_config_id: The ID of the global config (should be negative)
+        llm_config_id: The ID of the global config (should be negative or 0 for Auto)
 
     Returns:
         dict: Global config dictionary or None if not found
     """
-    if llm_config_id >= 0:
+    # Auto mode (ID 0) is handled separately via the router
+    if llm_config_id == AUTO_MODE_ID:
+        return {
+            "id": AUTO_MODE_ID,
+            "name": "Auto (Fastest)",
+            "description": "Automatically routes requests across available LLM providers for optimal performance and rate limit handling",
+            "provider": "AUTO",
+            "model_name": "auto",
+            "is_auto_mode": True,
+        }
+
+    if llm_config_id > 0:
         return None
 
     for cfg in config.GLOBAL_LLM_CONFIGS:
@@ -78,7 +102,7 @@ async def validate_llm_config(
                 "GROQ": "groq",
                 "COHERE": "cohere",
                 "GOOGLE": "gemini",
-                "OLLAMA": "ollama",
+                "OLLAMA": "ollama_chat",
                 "MISTRAL": "mistral",
                 "AZURE_OPENAI": "azure",
                 "OPENROUTER": "openrouter",
@@ -103,6 +127,7 @@ async def validate_llm_config(
                 "ALIBABA_QWEN": "openai",
                 "MOONSHOT": "openai",
                 "ZHIPU": "openai",  # GLM needs special handling
+                "GITHUB_MODELS": "github",
             }
             provider_prefix = provider_map.get(provider, provider.lower())
             model_string = f"{provider_prefix}/{model_name}"
@@ -145,20 +170,26 @@ async def validate_llm_config(
 
 
 async def get_search_space_llm_instance(
-    session: AsyncSession, search_space_id: int, role: str
-) -> ChatLiteLLM | None:
+    session: AsyncSession,
+    search_space_id: int,
+    role: str,
+    disable_streaming: bool = False,
+) -> ChatLiteLLM | ChatLiteLLMRouter | None:
     """
     Get a ChatLiteLLM instance for a specific search space and role.
 
     LLM preferences are stored at the search space level and shared by all members.
 
+    If Auto mode (ID 0) is configured, returns a ChatLiteLLMRouter that uses
+    LiteLLM Router for automatic load balancing across available providers.
+
     Args:
         session: Database session
         search_space_id: Search Space ID
-        role: LLM role ('long_context', 'fast', or 'strategic')
+        role: LLM role ('agent' or 'document_summary')
 
     Returns:
-        ChatLiteLLM instance or None if not found
+        ChatLiteLLM or ChatLiteLLMRouter instance, or None if not found
     """
     try:
         # Get the search space with its LLM preferences
@@ -173,19 +204,35 @@ async def get_search_space_llm_instance(
 
         # Get the appropriate LLM config ID based on role
         llm_config_id = None
-        if role == LLMRole.LONG_CONTEXT:
-            llm_config_id = search_space.long_context_llm_id
-        elif role == LLMRole.FAST:
-            llm_config_id = search_space.fast_llm_id
-        elif role == LLMRole.STRATEGIC:
-            llm_config_id = search_space.strategic_llm_id
+        if role == LLMRole.AGENT:
+            llm_config_id = search_space.agent_llm_id
+        elif role == LLMRole.DOCUMENT_SUMMARY:
+            llm_config_id = search_space.document_summary_llm_id
         else:
             logger.error(f"Invalid LLM role: {role}")
             return None
 
-        if not llm_config_id:
+        if llm_config_id is None:
             logger.error(f"No {role} LLM configured for search space {search_space_id}")
             return None
+
+        # Check for Auto mode (ID 0) - use router for load balancing
+        if is_auto_mode(llm_config_id):
+            if not LLMRouterService.is_initialized():
+                logger.error(
+                    "Auto mode requested but LLM Router not initialized. "
+                    "Ensure global_llm_config.yaml exists with valid configs."
+                )
+                return None
+
+            try:
+                logger.debug(
+                    f"Using Auto mode (LLM Router) for search space {search_space_id}, role {role}"
+                )
+                return get_auto_mode_llm(streaming=not disable_streaming)
+            except Exception as e:
+                logger.error(f"Failed to create ChatLiteLLMRouter: {e}")
+                return None
 
         # Check if this is a global config (negative ID)
         if llm_config_id < 0:
@@ -206,7 +253,7 @@ async def get_search_space_llm_instance(
                     "GROQ": "groq",
                     "COHERE": "cohere",
                     "GOOGLE": "gemini",
-                    "OLLAMA": "ollama",
+                    "OLLAMA": "ollama_chat",
                     "MISTRAL": "mistral",
                     "AZURE_OPENAI": "azure",
                     "OPENROUTER": "openrouter",
@@ -248,13 +295,16 @@ async def get_search_space_llm_instance(
             if global_config.get("litellm_params"):
                 litellm_kwargs.update(global_config["litellm_params"])
 
+            if disable_streaming:
+                litellm_kwargs["disable_streaming"] = True
+
             return ChatLiteLLM(**litellm_kwargs)
 
-        # Get the LLM configuration from database (user-specific config)
+        # Get the LLM configuration from database (NewLLMConfig)
         result = await session.execute(
-            select(LLMConfig).where(
-                LLMConfig.id == llm_config_id,
-                LLMConfig.search_space_id == search_space_id,
+            select(NewLLMConfig).where(
+                NewLLMConfig.id == llm_config_id,
+                NewLLMConfig.search_space_id == search_space_id,
             )
         )
         llm_config = result.scalars().first()
@@ -265,25 +315,25 @@ async def get_search_space_llm_instance(
             )
             return None
 
-        # Build the model string for litellm / 构建 LiteLLM 的模型字符串
+        # Build the model string for litellm
         if llm_config.custom_provider:
             model_string = f"{llm_config.custom_provider}/{llm_config.model_name}"
         else:
-            # Map provider enum to litellm format / 将提供商枚举映射为 LiteLLM 格式
+            # Map provider enum to litellm format
             provider_map = {
                 "OPENAI": "openai",
                 "ANTHROPIC": "anthropic",
                 "GROQ": "groq",
                 "COHERE": "cohere",
                 "GOOGLE": "gemini",
-                "OLLAMA": "ollama",
+                "OLLAMA": "ollama_chat",
                 "MISTRAL": "mistral",
                 "AZURE_OPENAI": "azure",
                 "OPENROUTER": "openrouter",
                 "COMETAPI": "cometapi",
                 "XAI": "xai",
                 "BEDROCK": "bedrock",
-                "AWS_BEDROCK": "bedrock",  # Legacy support (backward compatibility)
+                "AWS_BEDROCK": "bedrock",
                 "VERTEX_AI": "vertex_ai",
                 "TOGETHER_AI": "together_ai",
                 "FIREWORKS_AI": "fireworks_ai",
@@ -296,11 +346,11 @@ async def get_search_space_llm_instance(
                 "AI21": "ai21",
                 "CLOUDFLARE": "cloudflare",
                 "DATABRICKS": "databricks",
-                # Chinese LLM providers
                 "DEEPSEEK": "openai",
                 "ALIBABA_QWEN": "openai",
                 "MOONSHOT": "openai",
                 "ZHIPU": "openai",
+                "GITHUB_MODELS": "github",
             }
             provider_prefix = provider_map.get(
                 llm_config.provider.value, llm_config.provider.value.lower()
@@ -321,6 +371,9 @@ async def get_search_space_llm_instance(
         if llm_config.litellm_params:
             litellm_kwargs.update(llm_config.litellm_params)
 
+        if disable_streaming:
+            litellm_kwargs["disable_streaming"] = True
+
         return ChatLiteLLM(**litellm_kwargs)
 
     except Exception as e:
@@ -330,58 +383,36 @@ async def get_search_space_llm_instance(
         return None
 
 
-async def get_long_context_llm(
+async def get_agent_llm(
     session: AsyncSession, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Get the search space's long context LLM instance."""
+) -> ChatLiteLLM | ChatLiteLLMRouter | None:
+    """Get the search space's agent LLM instance for chat operations."""
+    return await get_search_space_llm_instance(session, search_space_id, LLMRole.AGENT)
+
+
+async def get_document_summary_llm(
+    session: AsyncSession, search_space_id: int, disable_streaming: bool = False
+) -> ChatLiteLLM | ChatLiteLLMRouter | None:
+    """Get the search space's document summary LLM instance."""
     return await get_search_space_llm_instance(
-        session, search_space_id, LLMRole.LONG_CONTEXT
+        session,
+        search_space_id,
+        LLMRole.DOCUMENT_SUMMARY,
+        disable_streaming=disable_streaming,
     )
 
 
-async def get_fast_llm(
-    session: AsyncSession, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Get the search space's fast LLM instance."""
-    return await get_search_space_llm_instance(session, search_space_id, LLMRole.FAST)
-
-
-async def get_strategic_llm(
-    session: AsyncSession, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Get the search space's strategic LLM instance."""
-    return await get_search_space_llm_instance(
-        session, search_space_id, LLMRole.STRATEGIC
-    )
-
-
-# Backward-compatible aliases (deprecated - will be removed in future versions)
-async def get_user_llm_instance(
-    session: AsyncSession, user_id: str, search_space_id: int, role: str
-) -> ChatLiteLLM | None:
-    """
-    Deprecated: Use get_search_space_llm_instance instead.
-    LLM preferences are now stored at the search space level, not per-user.
-    """
-    return await get_search_space_llm_instance(session, search_space_id, role)
-
-
+# Backward-compatible alias (LLM preferences are now per-search-space, not per-user)
 async def get_user_long_context_llm(
-    session: AsyncSession, user_id: str, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Deprecated: Use get_long_context_llm instead."""
-    return await get_long_context_llm(session, search_space_id)
-
-
-async def get_user_fast_llm(
-    session: AsyncSession, user_id: str, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Deprecated: Use get_fast_llm instead."""
-    return await get_fast_llm(session, search_space_id)
-
-
-async def get_user_strategic_llm(
-    session: AsyncSession, user_id: str, search_space_id: int
-) -> ChatLiteLLM | None:
-    """Deprecated: Use get_strategic_llm instead."""
-    return await get_strategic_llm(session, search_space_id)
+    session: AsyncSession,
+    user_id: str,
+    search_space_id: int,
+    disable_streaming: bool = False,
+) -> ChatLiteLLM | ChatLiteLLMRouter | None:
+    """
+    Deprecated: Use get_document_summary_llm instead.
+    The user_id parameter is ignored as LLM preferences are now per-search-space.
+    """
+    return await get_document_summary_llm(
+        session, search_space_id, disable_streaming=disable_streaming
+    )

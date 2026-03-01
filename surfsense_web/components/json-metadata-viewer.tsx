@@ -9,6 +9,7 @@ import {
 	DialogTitle,
 	DialogTrigger,
 } from "@/components/ui/dialog";
+import { Spinner } from "@/components/ui/spinner";
 import "react-json-view-lite/dist/index.css";
 
 interface JsonMetadataViewerProps {
@@ -17,6 +18,7 @@ interface JsonMetadataViewerProps {
 	trigger?: React.ReactNode;
 	open?: boolean;
 	onOpenChange?: (open: boolean) => void;
+	loading?: boolean;
 }
 
 export function JsonMetadataViewer({
@@ -25,6 +27,7 @@ export function JsonMetadataViewer({
 	trigger,
 	open,
 	onOpenChange,
+	loading,
 }: JsonMetadataViewerProps) {
 	// Ensure metadata is a valid object
 	const jsonData = React.useMemo(() => {
@@ -47,12 +50,20 @@ export function JsonMetadataViewer({
 	if (open !== undefined && onOpenChange !== undefined) {
 		return (
 			<Dialog open={open} onOpenChange={onOpenChange}>
-				<DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+				<DialogContent className="sm:max-w-4xl max-w-[95vw] w-full max-h-[80vh] overflow-y-auto p-4 sm:p-6">
 					<DialogHeader>
-						<DialogTitle>{title} - Metadata</DialogTitle>
+						<DialogTitle className="text-base sm:text-lg truncate pr-6">
+							{title} - Metadata
+						</DialogTitle>
 					</DialogHeader>
-					<div className="mt-4 p-4 bg-muted/30 rounded-md">
-						<JsonView data={jsonData} style={defaultStyles} />
+					<div className="mt-2 sm:mt-4 p-2 sm:p-4 bg-muted/30 rounded-md text-xs sm:text-sm">
+						{loading ? (
+							<div className="flex items-center justify-center py-12">
+								<Spinner size="lg" className="text-muted-foreground" />
+							</div>
+						) : (
+							<JsonView data={jsonData} style={defaultStyles} />
+						)}
 					</div>
 				</DialogContent>
 			</Dialog>
@@ -70,11 +81,13 @@ export function JsonMetadataViewer({
 					</Button>
 				)}
 			</DialogTrigger>
-			<DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+			<DialogContent className="sm:max-w-4xl max-w-[95vw] w-full max-h-[80vh] overflow-y-auto p-4 sm:p-6">
 				<DialogHeader>
-					<DialogTitle>{title} - Metadata</DialogTitle>
+					<DialogTitle className="text-base sm:text-lg truncate pr-6">
+						{title} - Metadata
+					</DialogTitle>
 				</DialogHeader>
-				<div className="mt-4 p-4 bg-muted/30 rounded-md">
+				<div className="mt-2 sm:mt-4 p-2 sm:p-4 bg-muted/30 rounded-md text-xs sm:text-sm">
 					<JsonView data={jsonData} style={defaultStyles} />
 				</div>
 			</DialogContent>

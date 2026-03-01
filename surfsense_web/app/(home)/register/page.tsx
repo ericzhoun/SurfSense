@@ -9,8 +9,15 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { registerMutationAtom } from "@/atoms/auth/auth-mutation.atoms";
 import { Logo } from "@/components/Logo";
+import { Spinner } from "@/components/ui/spinner";
 import { getAuthErrorDetails, isNetworkError, shouldRetry } from "@/lib/auth-errors";
+import { AUTH_TYPE } from "@/lib/env-config";
 import { AppError, ValidationError } from "@/lib/error";
+import {
+	trackRegistrationAttempt,
+	trackRegistrationFailure,
+	trackRegistrationSuccess,
+} from "@/lib/posthog/events";
 import { AmbientBackground } from "../login/AmbientBackground";
 
 export default function RegisterPage() {
@@ -31,8 +38,7 @@ export default function RegisterPage() {
 
 	// Check authentication type and redirect if not LOCAL
 	useEffect(() => {
-		const authType = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "GOOGLE";
-		if (authType !== "LOCAL") {
+		if (AUTH_TYPE !== "LOCAL") {
 			router.push("/login");
 		}
 	}, [router]);
@@ -52,8 +58,8 @@ export default function RegisterPage() {
 
 		setError({ title: null, message: null }); // Clear any previous errors
 
-		// Show loading toast
-		const loadingToast = toast.loading(t("creating_account"));
+		// Track registration attempt
+		trackRegistrationAttempt();
 
 		try {
 			await register({
@@ -64,9 +70,11 @@ export default function RegisterPage() {
 				is_verified: false,
 			});
 
+			// Track successful registration
+			trackRegistrationSuccess();
+
 			// Success toast
 			toast.success(t("register_success"), {
-				id: loadingToast,
 				description: t("redirecting_login"),
 				duration: 2000,
 			});
@@ -81,9 +89,9 @@ export default function RegisterPage() {
 					case 403: {
 						const friendlyMessage =
 							"Registrations are currently closed. If you need access, contact your administrator.";
+						trackRegistrationFailure("Registration disabled");
 						setError({ title: "Registration is disabled", message: friendlyMessage });
 						toast.error("Registration is disabled", {
-							id: loadingToast,
 							description: friendlyMessage,
 							duration: 6000,
 						});
@@ -94,9 +102,9 @@ export default function RegisterPage() {
 				}
 
 				if (err instanceof ValidationError) {
+					trackRegistrationFailure(err.message);
 					setError({ title: err.name, message: err.message });
 					toast.error(err.name, {
-						id: loadingToast,
 						description: err.message,
 						duration: 6000,
 					});
@@ -113,6 +121,9 @@ export default function RegisterPage() {
 				errorCode = "NETWORK_ERROR";
 			}
 
+			// Track registration failure
+			trackRegistrationFailure(errorCode);
+
 			// Get detailed error information from auth-errors utility
 			const errorDetails = getAuthErrorDetails(errorCode);
 
@@ -121,7 +132,6 @@ export default function RegisterPage() {
 
 			// Show error toast with conditional retry action
 			const toastOptions: any = {
-				id: loadingToast,
 				description: errorDetails.description,
 				duration: 6000,
 			};
@@ -141,17 +151,17 @@ export default function RegisterPage() {
 	return (
 		<div className="relative w-full overflow-hidden">
 			<AmbientBackground />
-			<div className="mx-auto flex h-screen max-w-lg flex-col items-center justify-center">
-				<Logo className="rounded-md" />
-				<h1 className="my-8 text-xl font-bold text-neutral-800 dark:text-neutral-100 md:text-4xl">
+			<div className="mx-auto flex h-screen max-w-lg flex-col items-center justify-center px-6 md:px-0">
+				<Logo className="h-16 w-16 md:h-32 md:w-32 rounded-md transition-all" />
+				<h1 className="mt-4 mb-6 text-xl font-bold text-neutral-800 dark:text-neutral-100 md:mt-8 md:mb-8 md:text-3xl lg:text-4xl transition-all">
 					{t("create_account")}
 				</h1>
 
 				<div className="w-full max-w-md">
-					<form onSubmit={handleSubmit} className="space-y-4">
+					<form onSubmit={handleSubmit} className="space-y-3 md:space-y-4">
 						{/* Enhanced Error Display */}
 						<AnimatePresence>
-							{error && error.title && (
+							{error?.title && (
 								<motion.div
 									initial={{ opacity: 0, y: -10, scale: 0.95 }}
 									animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -223,7 +233,7 @@ export default function RegisterPage() {
 								required
 								value={email}
 								onChange={(e) => setEmail(e.target.value)}
-								className={`mt-1 block w-full rounded-md border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-colors ${
+								className={`mt-1 block w-full rounded-md border px-3 py-1.5 md:py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-all ${
 									error.title
 										? "border-red-300 focus:border-red-500 focus:ring-red-500 dark:border-red-700"
 										: "border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-700"
@@ -245,7 +255,7 @@ export default function RegisterPage() {
 								required
 								value={password}
 								onChange={(e) => setPassword(e.target.value)}
-								className={`mt-1 block w-full rounded-md border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-colors ${
+								className={`mt-1 block w-full rounded-md border px-3 py-1.5 md:py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-all ${
 									error.title
 										? "border-red-300 focus:border-red-500 focus:ring-red-500 dark:border-red-700"
 										: "border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-700"
@@ -267,7 +277,7 @@ export default function RegisterPage() {
 								required
 								value={confirmPassword}
 								onChange={(e) => setConfirmPassword(e.target.value)}
-								className={`mt-1 block w-full rounded-md border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-colors ${
+								className={`mt-1 block w-full rounded-md border px-3 py-1.5 md:py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-all ${
 									error.title
 										? "border-red-300 focus:border-red-500 focus:ring-red-500 dark:border-red-700"
 										: "border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-700"
@@ -279,9 +289,16 @@ export default function RegisterPage() {
 						<button
 							type="submit"
 							disabled={isRegistering}
-							className="w-full rounded-md bg-blue-600 px-4 py-2 text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+							className="w-full rounded-md bg-blue-600 px-4 py-1.5 md:py-2 text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 transition-all text-sm md:text-base flex items-center justify-center gap-2"
 						>
-							{isRegistering ? t("creating_account_btn") : t("register")}
+							{isRegistering ? (
+								<>
+									<Spinner size="sm" className="text-white" />
+									<span>{t("creating_account_btn")}</span>
+								</>
+							) : (
+								t("register")
+							)}
 						</button>
 					</form>
 

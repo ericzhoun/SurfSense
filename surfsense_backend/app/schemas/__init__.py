@@ -1,32 +1,64 @@
-from .base import IDModel, TimestampModel
-from .chats import (
-    AISDKChatRequest,
-    ChatBase,
-    ChatCreate,
-    ChatRead,
-    ChatReadWithoutMessages,
-    ChatUpdate,
+from .auth import (
+    LogoutAllResponse,
+    LogoutRequest,
+    LogoutResponse,
+    RefreshTokenRequest,
+    RefreshTokenResponse,
 )
+from .base import IDModel, TimestampModel
 from .chunks import ChunkBase, ChunkCreate, ChunkRead, ChunkUpdate
 from .documents import (
     DocumentBase,
     DocumentRead,
     DocumentsCreate,
+    DocumentStatusBatchResponse,
+    DocumentStatusItemRead,
+    DocumentStatusSchema,
+    DocumentTitleRead,
+    DocumentTitleSearchResponse,
     DocumentUpdate,
     DocumentWithChunksRead,
     ExtensionDocumentContent,
     ExtensionDocumentMetadata,
     PaginatedResponse,
 )
-from .llm_config import LLMConfigBase, LLMConfigCreate, LLMConfigRead, LLMConfigUpdate
-from .logs import LogBase, LogCreate, LogFilter, LogRead, LogUpdate
-from .podcasts import (
-    PodcastBase,
-    PodcastCreate,
-    PodcastGenerateRequest,
-    PodcastRead,
-    PodcastUpdate,
+from .google_drive import DriveItem, GoogleDriveIndexingOptions, GoogleDriveIndexRequest
+from .image_generation import (
+    GlobalImageGenConfigRead,
+    ImageGenerationConfigCreate,
+    ImageGenerationConfigPublic,
+    ImageGenerationConfigRead,
+    ImageGenerationConfigUpdate,
+    ImageGenerationCreate,
+    ImageGenerationListRead,
+    ImageGenerationRead,
 )
+from .logs import LogBase, LogCreate, LogFilter, LogRead, LogUpdate
+from .new_chat import (
+    ChatMessage,
+    NewChatMessageAppend,
+    NewChatMessageCreate,
+    NewChatMessageRead,
+    NewChatRequest,
+    NewChatThreadCreate,
+    NewChatThreadRead,
+    NewChatThreadUpdate,
+    NewChatThreadWithMessages,
+    ThreadHistoryLoadResponse,
+    ThreadListItem,
+    ThreadListResponse,
+)
+from .new_llm_config import (
+    DefaultSystemInstructionsResponse,
+    GlobalNewLLMConfigRead,
+    LLMPreferencesRead,
+    LLMPreferencesUpdate,
+    NewLLMConfigCreate,
+    NewLLMConfigPublic,
+    NewLLMConfigRead,
+    NewLLMConfigUpdate,
+)
+from .podcasts import PodcastBase, PodcastCreate, PodcastRead, PodcastUpdate
 from .rbac_schemas import (
     InviteAcceptRequest,
     InviteAcceptResponse,
@@ -44,7 +76,18 @@ from .rbac_schemas import (
     RoleUpdate,
     UserSearchSpaceAccess,
 )
+from .reports import (
+    ReportBase,
+    ReportContentRead,
+    ReportContentUpdate,
+    ReportRead,
+    ReportVersionInfo,
+)
 from .search_source_connector import (
+    MCPConnectorCreate,
+    MCPConnectorRead,
+    MCPConnectorUpdate,
+    MCPServerConfig,
     SearchSourceConnectorBase,
     SearchSourceConnectorCreate,
     SearchSourceConnectorRead,
@@ -60,24 +103,44 @@ from .search_space import (
 from .users import UserCreate, UserRead, UserUpdate
 
 __all__ = [
-    "AISDKChatRequest",
-    "ChatBase",
-    "ChatCreate",
-    "ChatRead",
-    "ChatReadWithoutMessages",
-    "ChatUpdate",
+    # Chat schemas (assistant-ui integration)
+    "ChatMessage",
+    # Chunk schemas
     "ChunkBase",
     "ChunkCreate",
     "ChunkRead",
     "ChunkUpdate",
+    "DefaultSystemInstructionsResponse",
+    # Document schemas
     "DocumentBase",
     "DocumentRead",
+    "DocumentStatusBatchResponse",
+    "DocumentStatusItemRead",
+    "DocumentStatusSchema",
+    "DocumentTitleRead",
+    "DocumentTitleSearchResponse",
     "DocumentUpdate",
     "DocumentWithChunksRead",
     "DocumentsCreate",
+    # Google Drive schemas
+    "DriveItem",
     "ExtensionDocumentContent",
     "ExtensionDocumentMetadata",
+    "GlobalImageGenConfigRead",
+    "GlobalNewLLMConfigRead",
+    "GoogleDriveIndexRequest",
+    "GoogleDriveIndexingOptions",
+    # Base schemas
     "IDModel",
+    # Image Generation Config schemas
+    "ImageGenerationConfigCreate",
+    "ImageGenerationConfigPublic",
+    "ImageGenerationConfigRead",
+    "ImageGenerationConfigUpdate",
+    # Image Generation schemas
+    "ImageGenerationCreate",
+    "ImageGenerationListRead",
+    "ImageGenerationRead",
     # RBAC schemas
     "InviteAcceptRequest",
     "InviteAcceptResponse",
@@ -85,26 +148,56 @@ __all__ = [
     "InviteInfoResponse",
     "InviteRead",
     "InviteUpdate",
-    "LLMConfigBase",
-    "LLMConfigCreate",
-    "LLMConfigRead",
-    "LLMConfigUpdate",
+    # LLM Preferences schemas
+    "LLMPreferencesRead",
+    "LLMPreferencesUpdate",
+    # Log schemas
     "LogBase",
     "LogCreate",
     "LogFilter",
     "LogRead",
     "LogUpdate",
+    # Auth schemas
+    "LogoutAllResponse",
+    "LogoutRequest",
+    "LogoutResponse",
+    # Search source connector schemas
+    "MCPConnectorCreate",
+    "MCPConnectorRead",
+    "MCPConnectorUpdate",
+    "MCPServerConfig",
     "MembershipRead",
     "MembershipReadWithUser",
     "MembershipUpdate",
+    "NewChatMessageAppend",
+    "NewChatMessageCreate",
+    "NewChatMessageRead",
+    "NewChatRequest",
+    "NewChatThreadCreate",
+    "NewChatThreadRead",
+    "NewChatThreadUpdate",
+    "NewChatThreadWithMessages",
+    # NewLLMConfig schemas
+    "NewLLMConfigCreate",
+    "NewLLMConfigPublic",
+    "NewLLMConfigRead",
+    "NewLLMConfigUpdate",
     "PaginatedResponse",
     "PermissionInfo",
     "PermissionsListResponse",
+    # Podcast schemas
     "PodcastBase",
     "PodcastCreate",
-    "PodcastGenerateRequest",
     "PodcastRead",
     "PodcastUpdate",
+    "RefreshTokenRequest",
+    "RefreshTokenResponse",
+    # Report schemas
+    "ReportBase",
+    "ReportContentRead",
+    "ReportContentUpdate",
+    "ReportRead",
+    "ReportVersionInfo",
     "RoleCreate",
     "RoleRead",
     "RoleUpdate",
@@ -112,12 +205,17 @@ __all__ = [
     "SearchSourceConnectorCreate",
     "SearchSourceConnectorRead",
     "SearchSourceConnectorUpdate",
+    # Search space schemas
     "SearchSpaceBase",
     "SearchSpaceCreate",
     "SearchSpaceRead",
     "SearchSpaceUpdate",
     "SearchSpaceWithStats",
+    "ThreadHistoryLoadResponse",
+    "ThreadListItem",
+    "ThreadListResponse",
     "TimestampModel",
+    # User schemas
     "UserCreate",
     "UserRead",
     "UserSearchSpaceAccess",

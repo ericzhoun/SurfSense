@@ -1,4 +1,6 @@
 import asyncio
+import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -9,15 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from tavily import TavilyClient
 
-from app.agents.researcher.configuration import SearchMode
 from app.db import (
     Chunk,
     Document,
     SearchSourceConnector,
     SearchSourceConnectorType,
+    async_session_maker,
 )
 from app.retriever.chunks_hybrid_search import ChucksHybridSearchRetriever
 from app.retriever.documents_hybrid_search import DocumentHybridSearchRetriever
+from app.utils.perf import get_perf_logger
 
 
 class ConnectorService:
@@ -62,39 +65,35 @@ class ConnectorService:
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for crawled URLs and return both the source information and langchain documents
+        Search for crawled URLs and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            crawled_urls_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CRAWLED_URL",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            crawled_urls_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CRAWLED_URL",
-            )
-            # Transform document retriever results to match expected format
-            crawled_urls_chunks = self._transform_document_results(crawled_urls_chunks)
+        crawled_urls_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="CRAWLED_URL",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not crawled_urls_chunks:
+        if not crawled_urls_docs:
             return {
                 "id": 1,
                 "name": "Crawled URLs",
@@ -102,55 +101,44 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(crawled_urls_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return doc_info.get("title") or metadata.get("title") or "Untitled Document"
 
-                # Extract webcrawler-specific metadata
-                url = metadata.get("source", metadata.get("url", ""))
-                title = document.get(
-                    "title", metadata.get("title", "Untitled Document")
-                )
-                description = metadata.get("description", "")
-                language = metadata.get("language", "")
-                last_crawled_at = metadata.get("last_crawled_at", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("source") or metadata.get("url") or ""
 
-                # Build description with crawler info
-                content_preview = chunk.get("content", "")
-                if not description and content_preview:
-                    # Use content preview if no description
-                    description = content_preview[:200]
-                    if len(content_preview) > 200:
-                        description += "..."
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = metadata.get("description") or self._chunk_preview(
+                chunk.get("content", "")
+            )
+            info_parts = []
+            language = metadata.get("language", "")
+            last_crawled_at = metadata.get("last_crawled_at", "")
+            if language:
+                info_parts.append(f"Language: {language}")
+            if last_crawled_at:
+                info_parts.append(f"Last crawled: {last_crawled_at}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                # Add crawler metadata to description if available
-                info_parts = []
-                if language:
-                    info_parts.append(f"Language: {language}")
-                if last_crawled_at:
-                    info_parts.append(f"Last crawled: {last_crawled_at}")
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "language": metadata.get("language", ""),
+                "last_crawled_at": metadata.get("last_crawled_at", ""),
+            }
 
-                if info_parts:
-                    if description:
-                        description += f" | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "language": language,
-                    "last_crawled_at": last_crawled_at,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            crawled_urls_docs,
+            title_fn=_title_fn,
+            description_fn=_description_fn,
+            url_fn=_url_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -160,40 +148,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, crawled_urls_chunks
+        return result_object, crawled_urls_docs
 
     async def search_files(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for files and return both the source information and langchain documents
+        Search for files and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            files_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="FILE",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            files_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="FILE",
-            )
-            # Transform document retriever results to match expected format
-            files_chunks = self._transform_document_results(files_chunks)
+        files_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="FILE",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not files_chunks:
+        if not files_docs:
             return {
                 "id": 2,
                 "name": "Files",
@@ -201,27 +191,20 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(files_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            return (
+                metadata.get("og:description")
+                or metadata.get("ogDescription")
+                or self._chunk_preview(chunk.get("content", ""))
+            )
 
-                # Create a source entry
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": document.get("title", "Untitled Document"),
-                    "description": metadata.get(
-                        "og:description",
-                        metadata.get("ogDescription", chunk.get("content", "")),
-                    ),
-                    "url": metadata.get("url", ""),
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            files_docs,
+            description_fn=_description_fn,
+            url_fn=lambda _doc_info, metadata: metadata.get("url", "") or "",
+        )
 
         # Create result object
         result_object = {
@@ -231,37 +214,228 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, files_chunks
+        return result_object, files_docs
 
-    def _transform_document_results(
-        self, document_results: list[dict[str, Any]]
+    async def _combined_rrf_search(
+        self,
+        query_text: str,
+        search_space_id: int,
+        document_type: str,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        query_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Transform results from document_retriever.hybrid_search() to match the format
-        expected by the processing code.
+        Perform combined search using both chunk-based and document-based hybrid search,
+        then merge results using Reciprocal Rank Fusion (RRF) **at the document level**.
+
+        Returned results are **document-grouped** objects that contain a list of chunks
+        with real chunk IDs (used for downstream `[citation:<chunk_id>]`).
+
+        This method:
+        1. Runs chunk-level hybrid search (vector + keyword on chunks)
+        2. Runs document-level hybrid search (vector + keyword on documents, returns chunks)
+        3. Combines results using RRF based on their ranks in each result set
+        4. Returns top-k deduplicated results
 
         Args:
-            document_results: Results from document_retriever.hybrid_search()
+            query_text: The search query text
+            search_space_id: The search space ID to search within
+            document_type: Document type to filter (e.g., "FILE", "CRAWLED_URL")
+            top_k: Number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
-            List of transformed results in the format expected by the processing code
+            List of combined and deduplicated document results
         """
-        transformed_results = []
-        for doc in document_results:
-            transformed_results.append(
-                {
-                    "chunk_id": doc.get("document_id"),
-                    "document": {
-                        "id": doc.get("document_id"),
-                        "title": doc.get("title", "Untitled Document"),
-                        "document_type": doc.get("document_type"),
-                        "metadata": doc.get("metadata", {}),
-                    },
-                    "content": doc.get("chunks_content", doc.get("content", "")),
-                    "score": doc.get("score", 0.0),
-                }
+        from app.config import config
+
+        perf = get_perf_logger()
+        t0 = time.perf_counter()
+
+        # RRF constant
+        k = 60
+
+        # Get more results from each retriever for better fusion
+        retriever_top_k = top_k * 2
+
+        # Reuse caller-provided embedding or compute once for both retrievers.
+        if query_embedding is None:
+            t_embed = time.perf_counter()
+            query_embedding = config.embedding_model_instance.embed(query_text)
+            perf.info(
+                "[connector_svc] _combined_rrf embedding in %.3fs type=%s",
+                time.perf_counter() - t_embed,
+                document_type,
             )
-        return transformed_results
+
+        search_kwargs = {
+            "query_text": query_text,
+            "top_k": retriever_top_k,
+            "search_space_id": search_space_id,
+            "document_type": document_type,
+            "start_date": start_date,
+            "end_date": end_date,
+            "query_embedding": query_embedding,
+        }
+
+        # Run chunk and document retrievers in parallel using separate DB sessions
+        # so they don't contend on a shared AsyncSession connection.
+        async def _run_chunk_search() -> list[dict[str, Any]]:
+            async with async_session_maker() as session:
+                retriever = ChucksHybridSearchRetriever(session)
+                return await retriever.hybrid_search(**search_kwargs)
+
+        async def _run_doc_search() -> list[dict[str, Any]]:
+            async with async_session_maker() as session:
+                retriever = DocumentHybridSearchRetriever(session)
+                return await retriever.hybrid_search(**search_kwargs)
+
+        t_parallel = time.perf_counter()
+        chunk_results, doc_results = await asyncio.gather(
+            _run_chunk_search(), _run_doc_search()
+        )
+        perf.info(
+            "[connector_svc] _combined_rrf parallel retrievers in %.3fs "
+            "chunk_results=%d doc_results=%d type=%s",
+            time.perf_counter() - t_parallel,
+            len(chunk_results),
+            len(doc_results),
+            document_type,
+        )
+
+        # Helper to extract document_id from our doc-grouped result
+        def _doc_id(item: dict[str, Any]) -> int | None:
+            doc = item.get("document", {})
+            did = doc.get("id")
+            return int(did) if did is not None else None
+
+        # Build rank maps for RRF calculation (document-level)
+        chunk_ranks: dict[int, int] = {}
+        for rank, result in enumerate(chunk_results, start=1):
+            did = _doc_id(result)
+            if did is not None and did not in chunk_ranks:
+                chunk_ranks[did] = rank
+
+        doc_ranks: dict[int, int] = {}
+        for rank, result in enumerate(doc_results, start=1):
+            did = _doc_id(result)
+            if did is not None and did not in doc_ranks:
+                doc_ranks[did] = rank
+
+        all_doc_ids = set(chunk_ranks.keys()) | set(doc_ranks.keys())
+
+        # Calculate RRF scores for each document
+        rrf_scores: dict[int, float] = {}
+        for did in all_doc_ids:
+            chunk_rank = chunk_ranks.get(did)
+            doc_rank = doc_ranks.get(did)
+            score = 0.0
+            if chunk_rank is not None:
+                score += 1.0 / (k + chunk_rank)
+            if doc_rank is not None:
+                score += 1.0 / (k + doc_rank)
+            rrf_scores[did] = score
+
+        # Prefer chunk_results data, fallback to doc_results data
+        doc_data: dict[int, dict[str, Any]] = {}
+        for result in chunk_results:
+            did = _doc_id(result)
+            if did is not None and did not in doc_data:
+                doc_data[did] = result
+        for result in doc_results:
+            did = _doc_id(result)
+            if did is not None and did not in doc_data:
+                doc_data[did] = result
+
+        sorted_doc_ids = sorted(
+            all_doc_ids, key=lambda did: rrf_scores[did], reverse=True
+        )[:top_k]
+
+        combined_results: list[dict[str, Any]] = []
+        for did in sorted_doc_ids:
+            if did in doc_data:
+                result = doc_data[did].copy()
+                result["document_id"] = did
+                result["score"] = rrf_scores[did]
+                # Preserve chunks list if present
+                if "chunks" in doc_data[did]:
+                    result["chunks"] = doc_data[did]["chunks"]
+                combined_results.append(result)
+
+        perf.info(
+            "[connector_svc] _combined_rrf_search TOTAL in %.3fs results=%d type=%s space=%d",
+            time.perf_counter() - t0,
+            len(combined_results),
+            document_type,
+            search_space_id,
+        )
+        return combined_results
+
+    def _get_doc_url(self, metadata: dict[str, Any]) -> str:
+        return (
+            metadata.get("url")
+            or metadata.get("source")
+            or metadata.get("page_url")
+            or metadata.get("VisitedWebPageURL")
+            or ""
+        )
+
+    def _chunk_preview(self, text: str, limit: int = 200) -> str:
+        if not text:
+            return ""
+        text = str(text)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
+    def _build_chunk_sources_from_documents(
+        self,
+        documents: list[dict[str, Any]],
+        *,
+        title_fn=None,
+        description_fn=None,
+        url_fn=None,
+        extra_fields_fn=None,
+    ) -> list[dict[str, Any]]:
+        """
+        Build a chunk-level `sources` list from document-grouped results.
+
+        Each chunk becomes a source with `id == chunk_id` so the frontend can resolve
+        citations like `[citation:<chunk_id>]`.
+        """
+        sources: list[dict[str, Any]] = []
+
+        for doc in documents:
+            doc_info = doc.get("document", {}) or {}
+            metadata = doc_info.get("metadata", {}) or {}
+            url = url_fn(doc_info, metadata) if url_fn else self._get_doc_url(metadata)
+            chunks = doc.get("chunks", []) or []
+            display_title = (
+                title_fn(doc_info, metadata)
+                if title_fn
+                else doc_info.get("title", "Untitled Document")
+            )
+            for chunk in chunks:
+                chunk_id = chunk.get("chunk_id")
+                chunk_content = chunk.get("content", "")
+                description = (
+                    description_fn(chunk, doc_info, metadata)
+                    if description_fn
+                    else self._chunk_preview(chunk_content)
+                )
+                source = {
+                    "id": chunk_id,
+                    "title": display_title,
+                    "description": description,
+                    "url": url,
+                }
+                if extra_fields_fn:
+                    source.update(extra_fields_fn(chunk, doc_info, metadata) or {})
+                sources.append(source)
+        return sources
 
     async def get_connector_by_type(
         self,
@@ -806,33 +980,35 @@ class ConnectorService:
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for slack and return both the source information and langchain documents
+        Search for slack and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            slack_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="SLACK_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            slack_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="SLACK_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            slack_chunks = self._transform_document_results(slack_chunks)
+        slack_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="SLACK_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not slack_chunks:
+        if not slack_docs:
             return {
                 "id": 4,
                 "name": "Slack",
@@ -840,41 +1016,28 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(slack_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            channel_name = metadata.get("channel_name", "Unknown Channel")
+            message_date = metadata.get("start_date", "")
+            title = channel_name
+            if message_date:
+                title += f" ({message_date})"
+            return title
 
-                # Create a mapped source entry with Slack-specific metadata
-                channel_name = metadata.get("channel_name", "Unknown Channel")
-                channel_id = metadata.get("channel_id", "")
-                message_date = metadata.get("start_date", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            channel_id = metadata.get("channel_id", "")
+            return (
+                f"https://slack.com/app_redirect?channel={channel_id}"
+                if channel_id
+                else ""
+            )
 
-                # Create a more descriptive title for Slack messages
-                title = f"Slack: {channel_name}"
-                if message_date:
-                    title += f" ({message_date})"
-
-                # Create a more descriptive description for Slack messages
-                description = chunk.get("content", "")
-
-                # For URL, we can use a placeholder or construct a URL to the Slack channel if available
-                url = ""
-                if channel_id:
-                    url = f"https://slack.com/app_redirect?channel={channel_id}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            slack_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
 
         # Create result object
         result_object = {
@@ -884,45 +1047,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, slack_chunks
+        return result_object, slack_docs
 
     async def search_notion(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Notion pages and return both the source information and langchain documents
+        Search for Notion pages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            notion_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="NOTION_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            notion_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="NOTION_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            notion_chunks = self._transform_document_results(notion_chunks)
+        notion_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="NOTION_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not notion_chunks:
+        if not notion_docs:
             return {
                 "id": 5,
                 "name": "Notion",
@@ -930,44 +1090,24 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(notion_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_title = metadata.get("page_title", "Untitled Page")
+            indexed_at = metadata.get("indexed_at", "")
+            title = page_title
+            if indexed_at:
+                title += f" (indexed: {indexed_at})"
+            return title
 
-                # Create a mapped source entry with Notion-specific metadata
-                page_title = metadata.get("page_title", "Untitled Page")
-                page_id = metadata.get("page_id", "")
-                indexed_at = metadata.get("indexed_at", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_id = metadata.get("page_id", "")
+            return f"https://notion.so/{page_id.replace('-', '')}" if page_id else ""
 
-                # Create a more descriptive title for Notion pages
-                title = f"Notion: {page_title}"
-                if indexed_at:
-                    title += f" (indexed: {indexed_at})"
-
-                # Create a more descriptive description for Notion pages
-                description = chunk.get("content", "")
-                if len(description) == 100:
-                    description += "..."
-
-                # For URL, we can use a placeholder or construct a URL to the Notion page if available
-                url = ""
-                if page_id:
-                    # Notion page URLs follow this format
-                    url = f"https://notion.so/{page_id.replace('-', '')}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            notion_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
 
         # Create result object
         result_object = {
@@ -977,45 +1117,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, notion_chunks
+        return result_object, notion_docs
 
     async def search_extension(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for extension data and return both the source information and langchain documents
+        Search for extension data and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            extension_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="EXTENSION",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            extension_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="EXTENSION",
-            )
-            # Transform document retriever results to match expected format
-            extension_chunks = self._transform_document_results(extension_chunks)
+        extension_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="EXTENSION",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not extension_chunks:
+        if not extension_docs:
             return {
                 "id": 6,
                 "name": "Extension",
@@ -1023,68 +1160,51 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _, chunk in enumerate(extension_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            webpage_title = metadata.get("VisitedWebPageTitle", "Untitled Page")
+            visit_date = metadata.get("VisitedWebPageDateWithTimeInISOString", "")
+            title = webpage_title
+            if visit_date:
+                try:
+                    formatted_date = (
+                        visit_date.split("T")[0] if "T" in visit_date else visit_date
+                    )
+                    title += f" (visited: {formatted_date})"
+                except Exception:
+                    title += f" (visited: {visit_date})"
+            return title
 
-                # Extract extension-specific metadata
-                webpage_title = metadata.get("VisitedWebPageTitle", "Untitled Page")
-                webpage_url = metadata.get("VisitedWebPageURL", "")
-                visit_date = metadata.get("VisitedWebPageDateWithTimeInISOString", "")
-                visit_duration = metadata.get(
-                    "VisitedWebPageVisitDurationInMilliseconds", ""
-                )
-                _browsing_session_id = metadata.get("BrowsingSessionId", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("VisitedWebPageURL", "") or ""
 
-                # Create a more descriptive title for extension data
-                title = webpage_title
-                if visit_date:
-                    # Format the date for display (simplified)
-                    try:
-                        # Just extract the date part for display
-                        formatted_date = (
-                            visit_date.split("T")[0]
-                            if "T" in visit_date
-                            else visit_date
-                        )
-                        title += f" (visited: {formatted_date})"
-                    except Exception:
-                        # Fallback if date parsing fails
-                        title += f" (visited: {visit_date})"
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            visit_duration = metadata.get(
+                "VisitedWebPageVisitDurationInMilliseconds", ""
+            )
+            if visit_duration:
+                try:
+                    duration_seconds = int(visit_duration) / 1000
+                    duration_text = (
+                        f"{duration_seconds:.1f} seconds"
+                        if duration_seconds < 60
+                        else f"{duration_seconds / 60:.1f} minutes"
+                    )
+                    description = (description + f" | Duration: {duration_text}").strip(
+                        " |"
+                    )
+                except Exception:
+                    pass
+            return description
 
-                # Create a more descriptive description for extension data
-                description = chunk.get("content", "")
-                if len(description) == 100:
-                    description += "..."
-
-                # Add visit duration if available
-                if visit_duration:
-                    try:
-                        duration_seconds = int(visit_duration) / 1000
-                        if duration_seconds < 60:
-                            duration_text = f"{duration_seconds:.1f} seconds"
-                        else:
-                            duration_text = f"{duration_seconds / 60:.1f} minutes"
-
-                        if description:
-                            description += f" | Duration: {duration_text}"
-                    except Exception:
-                        # Fallback if duration parsing fails
-                        pass
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": webpage_url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            extension_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1094,45 +1214,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, extension_chunks
+        return result_object, extension_docs
 
     async def search_youtube(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for YouTube videos and return both the source information and langchain documents
+        Search for YouTube videos and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            youtube_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="YOUTUBE_VIDEO",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            youtube_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="YOUTUBE_VIDEO",
-            )
-            # Transform document retriever results to match expected format
-            youtube_chunks = self._transform_document_results(youtube_chunks)
+        youtube_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="YOUTUBE_VIDEO",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not youtube_chunks:
+        if not youtube_docs:
             return {
                 "id": 7,
                 "name": "YouTube Videos",
@@ -1140,44 +1257,35 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(youtube_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            video_title = metadata.get("video_title", "Untitled Video")
+            channel_name = metadata.get("channel_name", "")
+            return f"{video_title} - {channel_name}" if channel_name else video_title
 
-                # Extract YouTube-specific metadata
-                video_title = metadata.get("video_title", "Untitled Video")
-                video_id = metadata.get("video_id", "")
-                channel_name = metadata.get("channel_name", "")
-                # published_date = metadata.get('published_date', '')
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            video_id = metadata.get("video_id", "")
+            return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
-                # Create a more descriptive title for YouTube videos
-                title = video_title
-                if channel_name:
-                    title += f" - {channel_name}"
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            return metadata.get("description") or chunk.get("content", "")
 
-                # Create a more descriptive description for YouTube videos
-                description = metadata.get("description", chunk.get("content", ""))
-                if len(description) == 100:
-                    description += "..."
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "video_id": metadata.get("video_id", ""),
+                "channel_name": metadata.get("channel_name", ""),
+            }
 
-                # For URL, construct a URL to the YouTube video
-                url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "video_id": video_id,  # Additional field for YouTube videos
-                    "channel_name": channel_name,  # Additional field for YouTube videos
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            youtube_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1187,40 +1295,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, youtube_chunks
+        return result_object, youtube_docs
 
     async def search_github(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for GitHub documents and return both the source information and langchain documents
+        Search for GitHub documents and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            github_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GITHUB_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            github_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GITHUB_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            github_chunks = self._transform_document_results(github_chunks)
+        github_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="GITHUB_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not github_chunks:
+        if not github_docs:
             return {
                 "id": 8,
                 "name": "GitHub",
@@ -1228,28 +1338,13 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(github_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
-
-                # Create a source entry
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": document.get(
-                        "title", "GitHub Document"
-                    ),  # Use specific title if available
-                    "description": metadata.get(
-                        "description", chunk.get("content", "")
-                    ),  # Use description or content preview
-                    "url": metadata.get("url", ""),  # Use URL if available in metadata
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            github_docs,
+            description_fn=lambda chunk, _doc_info, metadata: (
+                metadata.get("description") or chunk.get("content", "")
+            ),
+            url_fn=lambda _doc_info, metadata: metadata.get("url", "") or "",
+        )
 
         # Create result object
         result_object = {
@@ -1259,45 +1354,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, github_chunks
+        return result_object, github_docs
 
     async def search_linear(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Linear issues and comments and return both the source information and langchain documents
+        Search for Linear issues and comments and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            linear_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="LINEAR_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            linear_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="LINEAR_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            linear_chunks = self._transform_document_results(linear_chunks)
+        linear_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="LINEAR_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not linear_chunks:
+        if not linear_docs:
             return {
                 "id": 9,
                 "name": "Linear Issues",
@@ -1305,56 +1397,54 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(linear_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            issue_identifier = metadata.get("issue_identifier", "")
+            issue_title = metadata.get("issue_title", "Untitled Issue")
+            issue_state = metadata.get("state", "")
+            title = (
+                f"{issue_identifier} - {issue_title}"
+                if issue_identifier
+                else issue_title
+            )
+            if issue_state:
+                title += f" ({issue_state})"
+            return title
 
-                # Extract Linear-specific metadata
-                issue_identifier = metadata.get("issue_identifier", "")
-                issue_title = metadata.get("issue_title", "Untitled Issue")
-                issue_state = metadata.get("state", "")
-                comment_count = metadata.get("comment_count", 0)
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            issue_identifier = metadata.get("issue_identifier", "")
+            return (
+                f"https://linear.app/issue/{issue_identifier}"
+                if issue_identifier
+                else ""
+            )
 
-                # Create a more descriptive title for Linear issues
-                title = f"Linear: {issue_identifier} - {issue_title}"
-                if issue_state:
-                    title += f" ({issue_state})"
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            comment_count = metadata.get("comment_count", 0)
+            if comment_count:
+                description = (description + f" | Comments: {comment_count}").strip(
+                    " |"
+                )
+            return description
 
-                # Create a more descriptive description for Linear issues
-                description = chunk.get("content", "")
-                if len(description) == 100:
-                    description += "..."
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "issue_identifier": metadata.get("issue_identifier", ""),
+                "state": metadata.get("state", ""),
+                "comment_count": metadata.get("comment_count", 0),
+            }
 
-                # Add comment count info to description
-                if comment_count:
-                    if description:
-                        description += f" | Comments: {comment_count}"
-                    else:
-                        description = f"Comments: {comment_count}"
-
-                # For URL, we could construct a URL to the Linear issue if we have the workspace info
-                # For now, use a generic placeholder
-                url = ""
-                if issue_identifier:
-                    # This is a generic format, may need to be adjusted based on actual Linear workspace
-                    url = f"https://linear.app/issue/{issue_identifier}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "issue_identifier": issue_identifier,
-                    "state": issue_state,
-                    "comment_count": comment_count,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            linear_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1364,46 +1454,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, linear_chunks
+        return result_object, linear_docs
 
     async def search_jira(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Jira issues and comments and return both the source information and langchain documents
+        Search for Jira issues and comments and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            jira_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="JIRA_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            jira_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="JIRA_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            jira_chunks = self._transform_document_results(jira_chunks)
+        jira_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="JIRA_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not jira_chunks:
+        if not jira_docs:
             return {
                 "id": 30,
                 "name": "Jira Issues",
@@ -1411,67 +1497,56 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(jira_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            issue_key = metadata.get("issue_key", "")
+            issue_title = metadata.get("issue_title", "Untitled Issue")
+            status = metadata.get("status", "")
+            title = f"{issue_key} - {issue_title}" if issue_key else issue_title
+            if status:
+                title += f" ({status})"
+            return title
 
-                # Extract Jira-specific metadata
-                issue_key = metadata.get("issue_key", "")
-                issue_title = metadata.get("issue_title", "Untitled Issue")
-                status = metadata.get("status", "")
-                priority = metadata.get("priority", "")
-                issue_type = metadata.get("issue_type", "")
-                comment_count = metadata.get("comment_count", 0)
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            issue_key = metadata.get("issue_key", "")
+            base_url = metadata.get("base_url")
+            return f"{base_url}/browse/{issue_key}" if issue_key and base_url else ""
 
-                # Create a more descriptive title for Jira issues
-                title = f"Jira: {issue_key} - {issue_title}"
-                if status:
-                    title += f" ({status})"
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            info_parts = []
+            priority = metadata.get("priority", "")
+            issue_type = metadata.get("issue_type", "")
+            comment_count = metadata.get("comment_count", 0)
+            if priority:
+                info_parts.append(f"Priority: {priority}")
+            if issue_type:
+                info_parts.append(f"Type: {issue_type}")
+            if comment_count:
+                info_parts.append(f"Comments: {comment_count}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                # Create a more descriptive description for Jira issues
-                description = chunk.get("content", "")
-                if len(description) == 100:
-                    description += "..."
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "issue_key": metadata.get("issue_key", ""),
+                "status": metadata.get("status", ""),
+                "priority": metadata.get("priority", ""),
+                "issue_type": metadata.get("issue_type", ""),
+                "comment_count": metadata.get("comment_count", 0),
+            }
 
-                # Add priority and type info to description
-                info_parts = []
-                if priority:
-                    info_parts.append(f"Priority: {priority}")
-                if issue_type:
-                    info_parts.append(f"Type: {issue_type}")
-                if comment_count:
-                    info_parts.append(f"Comments: {comment_count}")
-
-                if info_parts:
-                    if description:
-                        description += f" | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                # For URL, we could construct a URL to the Jira issue if we have the base URL
-                # For now, use a generic placeholder
-                url = ""
-                if issue_key and metadata.get("base_url"):
-                    url = f"{metadata.get('base_url')}/browse/{issue_key}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "issue_key": issue_key,
-                    "status": status,
-                    "priority": priority,
-                    "issue_type": issue_type,
-                    "comment_count": comment_count,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            jira_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1481,46 +1556,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, jira_chunks
+        return result_object, jira_docs
 
     async def search_google_calendar(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Google Calendar events and return both the source information and langchain documents
+        Search for Google Calendar events and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            calendar_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GOOGLE_CALENDAR_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            calendar_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GOOGLE_CALENDAR_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            calendar_chunks = self._transform_document_results(calendar_chunks)
+        calendar_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="GOOGLE_CALENDAR_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not calendar_chunks:
+        if not calendar_docs:
             return {
                 "id": 31,
                 "name": "Google Calendar Events",
@@ -1528,79 +1599,60 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(calendar_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            event_summary = metadata.get("event_summary", "Untitled Event")
+            start_time = metadata.get("start_time", "")
+            title = event_summary
+            if start_time:
+                title += f" ({start_time})"
+            return title
 
-                # Extract Google Calendar-specific metadata
-                event_id = metadata.get("event_id", "")
-                event_summary = metadata.get("event_summary", "Untitled Event")
-                calendar_id = metadata.get("calendar_id", "")
-                start_time = metadata.get("start_time", "")
-                end_time = metadata.get("end_time", "")
-                location = metadata.get("location", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            event_id = metadata.get("event_id", "")
+            calendar_id = metadata.get("calendar_id", "")
+            return (
+                f"https://calendar.google.com/calendar/event?eid={event_id}"
+                if event_id and calendar_id
+                else ""
+            )
 
-                # Create a more descriptive title for calendar events
-                title = f"Calendar: {event_summary}"
-                if start_time:
-                    # Format the start time for display
-                    try:
-                        if "T" in start_time:
-                            from datetime import datetime
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            info_parts = []
+            location = metadata.get("location", "")
+            calendar_id = metadata.get("calendar_id", "")
+            end_time = metadata.get("end_time", "")
+            if location:
+                info_parts.append(f"Location: {location}")
+            if calendar_id and calendar_id != "primary":
+                info_parts.append(f"Calendar: {calendar_id}")
+            if end_time:
+                info_parts.append(f"End: {end_time}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                            start_dt = datetime.fromisoformat(
-                                start_time.replace("Z", "+00:00")
-                            )
-                            formatted_time = start_dt.strftime("%Y-%m-%d %H:%M")
-                            title += f" ({formatted_time})"
-                        else:
-                            title += f" ({start_time})"
-                    except Exception:
-                        title += f" ({start_time})"
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "event_id": metadata.get("event_id", ""),
+                "event_summary": metadata.get("event_summary", "Untitled Event"),
+                "calendar_id": metadata.get("calendar_id", ""),
+                "start_time": metadata.get("start_time", ""),
+                "end_time": metadata.get("end_time", ""),
+                "location": metadata.get("location", ""),
+            }
 
-                # Create a more descriptive description for calendar events
-                description = chunk.get("content", "")
-
-                # Add event info to description
-                info_parts = []
-                if location:
-                    info_parts.append(f"Location: {location}")
-                if calendar_id and calendar_id != "primary":
-                    info_parts.append(f"Calendar: {calendar_id}")
-                if end_time:
-                    info_parts.append(f"End: {end_time}")
-
-                if info_parts:
-                    if description:
-                        description += f" | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                # For URL, we could construct a URL to the Google Calendar event
-                url = ""
-                if event_id and calendar_id:
-                    # Google Calendar event URL format
-                    url = f"https://calendar.google.com/calendar/event?eid={event_id}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "event_id": event_id,
-                    "event_summary": event_summary,
-                    "calendar_id": calendar_id,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "location": location,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            calendar_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1610,46 +1662,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, calendar_chunks
+        return result_object, calendar_docs
 
     async def search_airtable(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Airtable records and return both the source information and langchain documents
+        Search for Airtable records and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            airtable_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="AIRTABLE_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            airtable_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="AIRTABLE_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            airtable_chunks = self._transform_document_results(airtable_chunks)
+        airtable_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="AIRTABLE_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not airtable_chunks:
+        if not airtable_docs:
             return {
                 "id": 32,
                 "name": "Airtable Records",
@@ -1657,35 +1705,31 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process chunks to create sources
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(airtable_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            record_id = metadata.get("record_id", "")
+            return record_id if record_id else "Airtable Record"
 
-                # Extract Airtable-specific metadata
-                record_id = metadata.get("record_id", "")
-                created_time = metadata.get("created_time", "")
+        def _description_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            created_time = metadata.get("created_time", "")
+            return f"Created: {created_time}" if created_time else ""
 
-                # Create a more descriptive title for Airtable records
-                title = f"Airtable Record: {record_id}"
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "record_id": metadata.get("record_id", ""),
+                "created_time": metadata.get("created_time", ""),
+            }
 
-                # Create a more descriptive description for Airtable records
-                description = f"Created: {created_time}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": "",  # TODO: Add URL to Airtable record
-                    "record_id": record_id,
-                    "created_time": created_time,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            airtable_docs,
+            title_fn=_title_fn,
+            url_fn=lambda _doc_info, _metadata: "",
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         result_object = {
             "id": 32,
@@ -1694,46 +1738,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, airtable_chunks
+        return result_object, airtable_docs
 
     async def search_google_gmail(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Gmail messages and return both the source information and langchain documents
+        Search for Gmail messages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            gmail_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GOOGLE_GMAIL_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            gmail_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="GOOGLE_GMAIL_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            gmail_chunks = self._transform_document_results(gmail_chunks)
+        gmail_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="GOOGLE_GMAIL_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not gmail_chunks:
+        if not gmail_docs:
             return {
                 "id": 32,
                 "name": "Gmail Messages",
@@ -1741,70 +1781,54 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(gmail_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            subject = metadata.get("subject", "No Subject")
+            sender = metadata.get("sender", "Unknown Sender")
+            return (
+                f"Email: {subject} (from {sender})" if sender else f"Email: {subject}"
+            )
 
-                # Extract Gmail-specific metadata
-                message_id = metadata.get("message_id", "")
-                subject = metadata.get("subject", "No Subject")
-                sender = metadata.get("sender", "Unknown Sender")
-                date_str = metadata.get("date", "")
-                thread_id = metadata.get("thread_id", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            message_id = metadata.get("message_id", "")
+            return (
+                f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
+                if message_id
+                else ""
+            )
 
-                # Create a more descriptive title for Gmail messages
-                title = f"Email: {subject}"
-                if sender:
-                    # Extract just the email address or name from sender
-                    import re
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            info_parts = []
+            date_str = metadata.get("date", "")
+            thread_id = metadata.get("thread_id", "")
+            if date_str:
+                info_parts.append(f"Date: {date_str}")
+            if thread_id:
+                info_parts.append(f"Thread: {thread_id}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                    sender_match = re.search(r"<([^>]+)>", sender)
-                    if sender_match:
-                        sender_email = sender_match.group(1)
-                        title += f" (from {sender_email})"
-                    else:
-                        title += f" (from {sender})"
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "message_id": metadata.get("message_id", ""),
+                "subject": metadata.get("subject", "No Subject"),
+                "sender": metadata.get("sender", "Unknown Sender"),
+                "date": metadata.get("date", ""),
+                "thread_id": metadata.get("thread_id", ""),
+            }
 
-                # Create a more descriptive description for Gmail messages
-                description = chunk.get("content", "")
-
-                # Add message info to description
-                info_parts = []
-                if date_str:
-                    info_parts.append(f"Date: {date_str}")
-                if thread_id:
-                    info_parts.append(f"Thread: {thread_id}")
-
-                if info_parts:
-                    if description:
-                        description += f" | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                # For URL, we could construct a URL to the Gmail message
-                url = ""
-                if message_id:
-                    # Gmail message URL format
-                    url = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "message_id": message_id,
-                    "subject": subject,
-                    "sender": sender,
-                    "date": date_str,
-                    "thread_id": thread_id,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            gmail_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -1814,46 +1838,142 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, gmail_chunks
+        return result_object, gmail_docs
+
+    async def search_google_drive(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Google Drive files and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        drive_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="GOOGLE_DRIVE_FILE",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not drive_docs:
+            return {
+                "id": 33,
+                "name": "Google Drive Files",
+                "type": "GOOGLE_DRIVE_FILE",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return (
+                doc_info.get("title")
+                or metadata.get("google_drive_file_name")
+                or metadata.get("FILE_NAME")
+                or "Untitled File"
+            )
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            file_id = metadata.get("google_drive_file_id", "")
+            return f"https://drive.google.com/file/d/{file_id}/view" if file_id else ""
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""))
+            info_parts = []
+            mime_type = metadata.get("google_drive_mime_type", "")
+            modified_time = metadata.get("modified_time", "")
+            if mime_type:
+                # Simplify mime type for display
+                if "google-apps" in mime_type:
+                    file_type = mime_type.split(".")[-1].title()
+                else:
+                    file_type = mime_type.split("/")[-1].upper()
+                info_parts.append(f"Type: {file_type}")
+            if modified_time:
+                info_parts.append(f"Modified: {modified_time}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "google_drive_file_id": metadata.get("google_drive_file_id", ""),
+                "google_drive_mime_type": metadata.get("google_drive_mime_type", ""),
+                "modified_time": metadata.get("modified_time", ""),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            drive_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 33,  # Assign a unique ID for the Google Drive connector
+            "name": "Google Drive Files",
+            "type": "GOOGLE_DRIVE_FILE",
+            "sources": sources_list,
+        }
+
+        return result_object, drive_docs
 
     async def search_confluence(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Confluence pages and return both the source information and langchain documents
+        Search for Confluence pages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            confluence_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CONFLUENCE_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            confluence_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CONFLUENCE_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            confluence_chunks = self._transform_document_results(confluence_chunks)
+        confluence_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="CONFLUENCE_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not confluence_chunks:
+        if not confluence_docs:
             return {
                 "id": 40,
                 "name": "Confluence",
@@ -1861,41 +1981,25 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(confluence_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_title = metadata.get("page_title", "Untitled Page")
+            space_key = metadata.get("space_key", "")
+            title = page_title
+            if space_key:
+                title += f" ({space_key})"
+            return title
 
-                # Extract Confluence-specific metadata
-                page_title = metadata.get("page_title", "Untitled Page")
-                page_id = metadata.get("page_id", "")
-                space_key = metadata.get("space_key", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_id = metadata.get("page_id", "")
+            base_url = metadata.get("base_url", "")
+            return f"{base_url}/pages/{page_id}" if base_url and page_id else ""
 
-                # Create a more descriptive title for Confluence pages
-                title = f"Confluence: {page_title}"
-                if space_key:
-                    title += f" ({space_key})"
-
-                # Create a more descriptive description for Confluence pages
-                description = chunk.get("content", "")
-
-                # For URL, we can use a placeholder or construct a URL to the Confluence page if available
-                url = ""  # TODO: Add base_url to metadata
-                if page_id:
-                    url = f"{metadata.get('base_url')}/pages/{page_id}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            confluence_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
 
         # Create result object
         result_object = {
@@ -1905,46 +2009,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, confluence_chunks
+        return result_object, confluence_docs
 
     async def search_clickup(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for ClickUp tasks and return both the source information and langchain documents
+        Search for ClickUp tasks and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            clickup_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CLICKUP_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            clickup_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="CLICKUP_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            clickup_chunks = self._transform_document_results(clickup_chunks)
+        clickup_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="CLICKUP_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not clickup_chunks:
+        if not clickup_docs:
             return {
                 "id": 31,
                 "name": "ClickUp Tasks",
@@ -1952,62 +2052,48 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        sources_list = []
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("task_name", "ClickUp Task")
 
-        for chunk in clickup_chunks:
-            # Extract document metadata
-            document = chunk.get("document", {})
-            metadata = document.get("metadata", {})
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("task_url", "") or ""
 
-            # Extract ClickUp task information from metadata
-            task_name = metadata.get("task_name", "Unknown Task")
-            task_id = metadata.get("task_id", "")
-            task_url = metadata.get("task_url", "")
-            task_status = metadata.get("task_status", "Unknown")
-            task_priority = metadata.get("task_priority", "Unknown")
-            task_assignees = metadata.get("task_assignees", [])
-            task_due_date = metadata.get("task_due_date", "")
-            task_list_name = metadata.get("task_list_name", "")
-            task_space_name = metadata.get("task_space_name", "")
+        def _description_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            parts = []
+            if metadata.get("task_status"):
+                parts.append(f"Status: {metadata.get('task_status')}")
+            if metadata.get("task_priority"):
+                parts.append(f"Priority: {metadata.get('task_priority')}")
+            if metadata.get("task_due_date"):
+                parts.append(f"Due: {metadata.get('task_due_date')}")
+            if metadata.get("task_list_name"):
+                parts.append(f"List: {metadata.get('task_list_name')}")
+            if metadata.get("task_space_name"):
+                parts.append(f"Space: {metadata.get('task_space_name')}")
+            return " | ".join(parts) if parts else "ClickUp Task"
 
-            # Create description from task details
-            description_parts = []
-            if task_status:
-                description_parts.append(f"Status: {task_status}")
-            if task_priority:
-                description_parts.append(f"Priority: {task_priority}")
-            if task_assignees:
-                assignee_names = [
-                    assignee.get("username", "Unknown") for assignee in task_assignees
-                ]
-                description_parts.append(f"Assignees: {', '.join(assignee_names)}")
-            if task_due_date:
-                description_parts.append(f"Due: {task_due_date}")
-            if task_list_name:
-                description_parts.append(f"List: {task_list_name}")
-            if task_space_name:
-                description_parts.append(f"Space: {task_space_name}")
-
-            description = (
-                " | ".join(description_parts) if description_parts else "ClickUp Task"
-            )
-
-            source = {
-                "id": chunk.get("chunk_id", self.source_id_counter),
-                "title": task_name,
-                "description": description,
-                "url": task_url,
-                "task_id": task_id,
-                "status": task_status,
-                "priority": task_priority,
-                "assignees": task_assignees,
-                "due_date": task_due_date,
-                "list_name": task_list_name,
-                "space_name": task_space_name,
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "task_id": metadata.get("task_id", ""),
+                "status": metadata.get("task_status", ""),
+                "priority": metadata.get("task_priority", ""),
+                "assignees": metadata.get("task_assignees", []),
+                "due_date": metadata.get("task_due_date", ""),
+                "list_name": metadata.get("task_list_name", ""),
+                "space_name": metadata.get("task_space_name", ""),
             }
 
-            self.source_id_counter += 1
-            sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            clickup_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -2017,7 +2103,7 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, clickup_chunks
+        return result_object, clickup_docs
 
     async def search_linkup(
         self,
@@ -2145,38 +2231,35 @@ class ConnectorService:
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Discord messages and return both the source information and langchain documents
+        Search for Discord messages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            discord_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="DISCORD_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            discord_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="DISCORD_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            discord_chunks = self._transform_document_results(discord_chunks)
+        discord_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="DISCORD_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not discord_chunks:
+        if not discord_docs:
             return {
                 "id": 11,
                 "name": "Discord",
@@ -2184,44 +2267,29 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _, chunk in enumerate(discord_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            channel_name = metadata.get("channel_name", "Unknown Channel")
+            message_date = metadata.get("start_date", "")
+            title = channel_name
+            if message_date:
+                title += f" ({message_date})"
+            return title
 
-                # Create a mapped source entry with Discord-specific metadata
-                channel_name = metadata.get("channel_name", "Unknown Channel")
-                channel_id = metadata.get("channel_id", "")
-                message_date = metadata.get("start_date", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            channel_id = metadata.get("channel_id", "")
+            guild_id = metadata.get("guild_id", "")
+            if guild_id and channel_id:
+                return f"https://discord.com/channels/{guild_id}/{channel_id}"
+            if channel_id:
+                return f"https://discord.com/channels/@me/{channel_id}"
+            return ""
 
-                # Create a more descriptive title for Discord messages
-                title = f"Discord: {channel_name}"
-                if message_date:
-                    title += f" ({message_date})"
-
-                # Create a more descriptive description for Discord messages
-                description = chunk.get("content", "")
-
-                url = ""
-                guild_id = metadata.get("guild_id", "")
-                if guild_id and channel_id:
-                    url = f"https://discord.com/channels/{guild_id}/{channel_id}"
-                elif channel_id:
-                    # Fallback for DM channels or when guild_id is not available
-                    url = f"https://discord.com/channels/@me/{channel_id}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            discord_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
 
         # Create result object
         result_object = {
@@ -2231,46 +2299,116 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, discord_chunks
+        return result_object, discord_docs
+
+    async def search_teams(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Microsoft Teams messages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        teams_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="TEAMS_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not teams_docs:
+            return {
+                "id": 53,
+                "name": "Microsoft Teams",
+                "type": "TEAMS_CONNECTOR",
+                "sources": [],
+            }, []
+
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            team_name = metadata.get("team_name", "Unknown Team")
+            channel_name = metadata.get("channel_name", "Unknown Channel")
+            message_date = metadata.get("start_date", "")
+            title = f"{team_name} - {channel_name}"
+            if message_date:
+                title += f" ({message_date})"
+            return title
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            team_id = metadata.get("team_id", "")
+            channel_id = metadata.get("channel_id", "")
+            if team_id and channel_id:
+                return f"https://teams.microsoft.com/l/channel/{channel_id}/General?groupId={team_id}"
+            return ""
+
+        sources_list = self._build_chunk_sources_from_documents(
+            teams_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
+
+        # Create result object
+        result_object = {
+            "id": 53,
+            "name": "Microsoft Teams",
+            "type": "TEAMS_CONNECTOR",
+            "sources": sources_list,
+        }
+
+        return result_object, teams_docs
 
     async def search_luma(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Luma events and return both the source information and langchain documents
+        Search for Luma events and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            luma_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="LUMA_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            luma_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="LUMA_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            luma_chunks = self._transform_document_results(luma_chunks)
+        luma_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="LUMA_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not luma_chunks:
+        if not luma_docs:
             return {
                 "id": 33,
                 "name": "Luma Events",
@@ -2278,104 +2416,59 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(luma_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            event_name = metadata.get("event_name", "Untitled Event")
+            start_time = metadata.get("start_time", "")
+            return f"{event_name} ({start_time})" if start_time else event_name
 
-                # Extract Luma-specific metadata
-                event_id = metadata.get("event_id", "")
-                event_name = metadata.get("event_name", "Untitled Event")
-                event_url = metadata.get("event_url", "")
-                start_time = metadata.get("start_time", "")
-                end_time = metadata.get("end_time", "")
-                location_name = metadata.get("location_name", "")
-                location_address = metadata.get("location_address", "")
-                meeting_url = metadata.get("meeting_url", "")
-                timezone = metadata.get("timezone", "")
-                visibility = metadata.get("visibility", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("event_url", "") or ""
 
-                # Create a more descriptive title for Luma events
-                title = f"Luma: {event_name}"
-                if start_time:
-                    # Format the start time for display
-                    try:
-                        if "T" in start_time:
-                            from datetime import datetime
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = chunk.get("content", "")
+            info_parts = []
+            if metadata.get("location_name"):
+                info_parts.append(f"Venue: {metadata.get('location_name')}")
+            elif metadata.get("location_address"):
+                info_parts.append(f"Location: {metadata.get('location_address')}")
+            if metadata.get("meeting_url"):
+                info_parts.append("Online Event")
+            if metadata.get("end_time"):
+                info_parts.append(f"Ends: {metadata.get('end_time')}")
+            if metadata.get("timezone"):
+                info_parts.append(f"TZ: {metadata.get('timezone')}")
+            if metadata.get("visibility"):
+                info_parts.append(
+                    f"Visibility: {str(metadata.get('visibility')).title()}"
+                )
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                            start_dt = datetime.fromisoformat(
-                                start_time.replace("Z", "+00:00")
-                            )
-                            formatted_time = start_dt.strftime("%Y-%m-%d %H:%M")
-                            title += f" ({formatted_time})"
-                        else:
-                            title += f" ({start_time})"
-                    except Exception:
-                        title += f" ({start_time})"
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "event_id": metadata.get("event_id", ""),
+                "event_name": metadata.get("event_name", "Untitled Event"),
+                "start_time": metadata.get("start_time", ""),
+                "end_time": metadata.get("end_time", ""),
+                "location_name": metadata.get("location_name", ""),
+                "location_address": metadata.get("location_address", ""),
+                "meeting_url": metadata.get("meeting_url", ""),
+                "timezone": metadata.get("timezone", ""),
+                "visibility": metadata.get("visibility", ""),
+            }
 
-                description = chunk.get("content", "")
-
-                # Add event info to description
-                info_parts = []
-                if location_name:
-                    info_parts.append(f"Venue: {location_name}")
-                elif location_address:
-                    info_parts.append(f"Location: {location_address}")
-
-                if meeting_url:
-                    info_parts.append("Online Event")
-
-                if end_time:
-                    try:
-                        if "T" in end_time:
-                            from datetime import datetime
-
-                            end_dt = datetime.fromisoformat(
-                                end_time.replace("Z", "+00:00")
-                            )
-                            formatted_end = end_dt.strftime("%Y-%m-%d %H:%M")
-                            info_parts.append(f"Ends: {formatted_end}")
-                        else:
-                            info_parts.append(f"Ends: {end_time}")
-                    except Exception:
-                        info_parts.append(f"Ends: {end_time}")
-
-                if timezone:
-                    info_parts.append(f"TZ: {timezone}")
-
-                if visibility:
-                    info_parts.append(f"Visibility: {visibility.title()}")
-
-                if info_parts:
-                    if description:
-                        description += f" | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                # Use the Luma event URL if available
-                url = event_url if event_url else ""
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "event_id": event_id,
-                    "event_name": event_name,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "location_name": location_name,
-                    "location_address": location_address,
-                    "meeting_url": meeting_url,
-                    "timezone": timezone,
-                    "visibility": visibility,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            luma_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -2385,48 +2478,42 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, luma_chunks
+        return result_object, luma_docs
 
     async def search_elasticsearch(
         self,
         user_query: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for Elasticsearch documents and return both the source information and langchain documents
+        Search for Elasticsearch documents and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            elasticsearch_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="ELASTICSEARCH_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            elasticsearch_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                search_space_id=search_space_id,
-                document_type="ELASTICSEARCH_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            elasticsearch_chunks = self._transform_document_results(
-                elasticsearch_chunks
-            )
+        elasticsearch_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="ELASTICSEARCH_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not elasticsearch_chunks:
+        if not elasticsearch_docs:
             return {
                 "id": 34,
                 "name": "Elasticsearch",
@@ -2434,58 +2521,40 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(elasticsearch_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            title = doc_info.get("title", "Elasticsearch Document")
+            es_index = metadata.get("elasticsearch_index", "")
+            return f"{title} (Index: {es_index})" if es_index else title
 
-                # Extract Elasticsearch-specific metadata
-                es_id = metadata.get("elasticsearch_id", "")
-                es_index = metadata.get("elasticsearch_index", "")
-                es_score = metadata.get("elasticsearch_score", "")
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=150)
+            info_parts = []
+            if metadata.get("elasticsearch_id"):
+                info_parts.append(f"ID: {metadata.get('elasticsearch_id')}")
+            if metadata.get("elasticsearch_score"):
+                info_parts.append(f"Score: {metadata.get('elasticsearch_score')}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
 
-                # Create a more descriptive title for Elasticsearch documents
-                title = document.get("title", "Elasticsearch Document")
-                if es_index:
-                    title = f"{title} (Index: {es_index})"
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "elasticsearch_id": metadata.get("elasticsearch_id", ""),
+                "elasticsearch_index": metadata.get("elasticsearch_index", ""),
+                "elasticsearch_score": metadata.get("elasticsearch_score", ""),
+            }
 
-                # Create a more descriptive description for Elasticsearch documents
-                description = chunk.get("content", "")[:150]
-                if len(description) == 150:
-                    description += "..."
-
-                # Add Elasticsearch info to description
-                info_parts = []
-                if es_id:
-                    info_parts.append(f"ID: {es_id}")
-                if es_score:
-                    info_parts.append(f"Score: {es_score}")
-
-                if info_parts:
-                    if description:
-                        description = f"{description} | {' | '.join(info_parts)}"
-                    else:
-                        description = " | ".join(info_parts)
-
-                # For URL, we could construct a URL to view the document if we have the Elasticsearch UI URL
-                url = ""
-                # Could be extended to include Kibana or other UI URLs if configured
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "elasticsearch_id": es_id,
-                    "elasticsearch_index": es_index,
-                    "elasticsearch_score": es_score,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            elasticsearch_docs,
+            title_fn=_title_fn,
+            url_fn=lambda _doc_info, _metadata: "",
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
 
         # Create result object
         result_object = {
@@ -2495,50 +2564,112 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, elasticsearch_chunks
+        return result_object, elasticsearch_docs
+
+    async def search_notes(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Notes and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        notes_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="NOTE",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not notes_docs:
+            return {
+                "id": 51,
+                "name": "Notes",
+                "type": "NOTE",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return doc_info.get("title", "Untitled Note")
+
+        def _url_fn(_doc_info: dict[str, Any], _metadata: dict[str, Any]) -> str:
+            return ""  # Notes don't have URLs
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], _metadata: dict[str, Any]
+        ) -> str:
+            return self._chunk_preview(chunk.get("content", ""), limit=200)
+
+        sources_list = self._build_chunk_sources_from_documents(
+            notes_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 51,
+            "name": "Notes",
+            "type": "NOTE",
+            "sources": sources_list,
+        }
+
+        return result_object, notes_docs
 
     async def search_bookstack(
         self,
         user_query: str,
-        user_id: str,
         search_space_id: int,
         top_k: int = 20,
-        search_mode: SearchMode = SearchMode.CHUNKS,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> tuple:
         """
-        Search for BookStack pages and return both the source information and langchain documents
+        Search for BookStack pages and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
 
         Args:
             user_query: The user's query
             user_id: The user's ID
             search_space_id: The search space ID to search in
             top_k: Maximum number of results to return
-            search_mode: Search mode (CHUNKS or DOCUMENTS)
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             tuple: (sources_info, langchain_documents)
         """
-        if search_mode == SearchMode.CHUNKS:
-            bookstack_chunks = await self.chunk_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                user_id=user_id,
-                search_space_id=search_space_id,
-                document_type="BOOKSTACK_CONNECTOR",
-            )
-        elif search_mode == SearchMode.DOCUMENTS:
-            bookstack_chunks = await self.document_retriever.hybrid_search(
-                query_text=user_query,
-                top_k=top_k,
-                user_id=user_id,
-                search_space_id=search_space_id,
-                document_type="BOOKSTACK_CONNECTOR",
-            )
-            # Transform document retriever results to match expected format
-            bookstack_chunks = self._transform_document_results(bookstack_chunks)
+        bookstack_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="BOOKSTACK_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         # Early return if no results
-        if not bookstack_chunks:
+        if not bookstack_docs:
             return {
                 "id": 50,
                 "name": "BookStack",
@@ -2546,41 +2677,27 @@ class ConnectorService:
                 "sources": [],
             }, []
 
-        # Process each chunk and create sources directly without deduplication
-        sources_list = []
-        async with self.counter_lock:
-            for _i, chunk in enumerate(bookstack_chunks):
-                # Extract document metadata
-                document = chunk.get("document", {})
-                metadata = document.get("metadata", {})
+        def _title_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_name = metadata.get("page_name", "Untitled Page")
+            return page_name
 
-                # Extract BookStack-specific metadata
-                page_name = metadata.get("page_name", "Untitled Page")
-                page_slug = metadata.get("page_slug", "")
-                book_slug = metadata.get("book_slug", "")
-                base_url = metadata.get("base_url", "")
-                page_url = metadata.get("page_url", "")
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            page_slug = metadata.get("page_slug", "")
+            book_slug = metadata.get("book_slug", "")
+            base_url = metadata.get("base_url", "")
+            page_url = metadata.get("page_url", "")
+            if page_url:
+                return page_url
+            if base_url and book_slug and page_slug:
+                return f"{base_url}/books/{book_slug}/page/{page_slug}"
+            return ""
 
-                # Create a more descriptive title for BookStack pages
-                title = f"BookStack: {page_name}"
-
-                # Create description from content
-                description = chunk.get("content", "")
-
-                # Build URL to the BookStack page
-                url = page_url
-                if not url and base_url and book_slug and page_slug:
-                    url = f"{base_url}/books/{book_slug}/page/{page_slug}"
-
-                source = {
-                    "id": chunk.get("chunk_id", self.source_id_counter),
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                }
-
-                self.source_id_counter += 1
-                sources_list.append(source)
+        sources_list = self._build_chunk_sources_from_documents(
+            bookstack_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=lambda chunk, _doc_info, _metadata: chunk.get("content", ""),
+        )
 
         # Create result object
         result_object = {
@@ -2590,4 +2707,542 @@ class ConnectorService:
             "sources": sources_list,
         }
 
-        return result_object, bookstack_chunks
+        return result_object, bookstack_docs
+
+    async def search_circleback(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Circleback meeting notes and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        circleback_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="CIRCLEBACK",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not circleback_docs:
+            return {
+                "id": 52,
+                "name": "Circleback Meetings",
+                "type": "CIRCLEBACK",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            meeting_name = metadata.get("meeting_name", "")
+            meeting_date = metadata.get("meeting_date", "")
+            title = doc_info.get("title") or meeting_name or "Circleback Meeting"
+            if meeting_date:
+                title += f" ({meeting_date})"
+            return title
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            meeting_id = metadata.get("circleback_meeting_id", "")
+            return (
+                f"https://app.circleback.ai/meetings/{meeting_id}" if meeting_id else ""
+            )
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=200)
+            info_parts = []
+            duration = metadata.get("duration_seconds")
+            attendee_count = metadata.get("attendee_count")
+            if duration:
+                minutes = int(duration) // 60
+                info_parts.append(f"Duration: {minutes} min")
+            if attendee_count:
+                info_parts.append(f"Attendees: {attendee_count}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "circleback_meeting_id": metadata.get("circleback_meeting_id", ""),
+                "meeting_name": metadata.get("meeting_name", ""),
+                "meeting_date": metadata.get("meeting_date", ""),
+                "duration_seconds": metadata.get("duration_seconds", 0),
+                "attendee_count": metadata.get("attendee_count", 0),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            circleback_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 52,
+            "name": "Circleback Meetings",
+            "type": "CIRCLEBACK",
+            "sources": sources_list,
+        }
+
+        return result_object, circleback_docs
+
+    async def search_obsidian(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Obsidian vault notes and return both the source information and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        obsidian_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="OBSIDIAN_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not obsidian_docs:
+            return {
+                "id": 53,
+                "name": "Obsidian Vault",
+                "type": "OBSIDIAN_CONNECTOR",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return doc_info.get("title", "Untitled Note")
+
+        def _url_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            # Obsidian URL format: obsidian://vault_name/path
+            return doc_info.get("url", "")
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=200)
+            info_parts = []
+            vault_name = metadata.get("vault_name")
+            tags = metadata.get("tags", [])
+            if vault_name:
+                info_parts.append(f"Vault: {vault_name}")
+            if tags and isinstance(tags, list) and len(tags) > 0:
+                info_parts.append(f"Tags: {', '.join(tags[:3])}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "vault_name": metadata.get("vault_name", ""),
+                "file_path": metadata.get("file_path", ""),
+                "tags": metadata.get("tags", []),
+                "outgoing_links": metadata.get("outgoing_links", []),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            obsidian_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 53,
+            "name": "Obsidian Vault",
+            "type": "OBSIDIAN_CONNECTOR",
+            "sources": sources_list,
+        }
+
+        return result_object, obsidian_docs
+
+    # =========================================================================
+    # Composio Connector Search Methods
+    # =========================================================================
+
+    async def search_composio_google_drive(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Composio Google Drive files and return both the source information
+        and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        composio_drive_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="COMPOSIO_GOOGLE_DRIVE_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not composio_drive_docs:
+            return {
+                "id": 54,
+                "name": "Google Drive (Composio)",
+                "type": "COMPOSIO_GOOGLE_DRIVE_CONNECTOR",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return (
+                doc_info.get("title")
+                or metadata.get("title")
+                or metadata.get("file_name")
+                or "Untitled Document"
+            )
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("url") or metadata.get("web_view_link") or ""
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=200)
+            info_parts = []
+            mime_type = metadata.get("mime_type")
+            modified_time = metadata.get("modified_time")
+            if mime_type:
+                info_parts.append(f"Type: {mime_type}")
+            if modified_time:
+                info_parts.append(f"Modified: {modified_time}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "mime_type": metadata.get("mime_type", ""),
+                "file_id": metadata.get("file_id", ""),
+                "modified_time": metadata.get("modified_time", ""),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            composio_drive_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 54,
+            "name": "Google Drive (Composio)",
+            "type": "COMPOSIO_GOOGLE_DRIVE_CONNECTOR",
+            "sources": sources_list,
+        }
+
+        return result_object, composio_drive_docs
+
+    async def search_composio_gmail(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Composio Gmail messages and return both the source information
+        and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        composio_gmail_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="COMPOSIO_GMAIL_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not composio_gmail_docs:
+            return {
+                "id": 55,
+                "name": "Gmail (Composio)",
+                "type": "COMPOSIO_GMAIL_CONNECTOR",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return (
+                doc_info.get("title")
+                or metadata.get("subject")
+                or metadata.get("title")
+                or "Untitled Email"
+            )
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("url") or ""
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=200)
+            info_parts = []
+            sender = metadata.get("from") or metadata.get("sender")
+            date = metadata.get("date") or metadata.get("received_at")
+            if sender:
+                info_parts.append(f"From: {sender}")
+            if date:
+                info_parts.append(f"Date: {date}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "message_id": metadata.get("message_id", ""),
+                "thread_id": metadata.get("thread_id", ""),
+                "from": metadata.get("from", ""),
+                "to": metadata.get("to", ""),
+                "date": metadata.get("date", ""),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            composio_gmail_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 55,
+            "name": "Gmail (Composio)",
+            "type": "COMPOSIO_GMAIL_CONNECTOR",
+            "sources": sources_list,
+        }
+
+        return result_object, composio_gmail_docs
+
+    async def search_composio_google_calendar(
+        self,
+        user_query: str,
+        search_space_id: int,
+        top_k: int = 20,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> tuple:
+        """
+        Search for Composio Google Calendar events and return both the source information
+        and langchain documents.
+
+        Uses combined chunk-level and document-level hybrid search with RRF fusion.
+
+        Args:
+            user_query: The user's query
+            search_space_id: The search space ID to search in
+            top_k: Maximum number of results to return
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+
+        Returns:
+            tuple: (sources_info, langchain_documents)
+        """
+        composio_calendar_docs = await self._combined_rrf_search(
+            query_text=user_query,
+            search_space_id=search_space_id,
+            document_type="COMPOSIO_GOOGLE_CALENDAR_CONNECTOR",
+            top_k=top_k,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        # Early return if no results
+        if not composio_calendar_docs:
+            return {
+                "id": 56,
+                "name": "Google Calendar (Composio)",
+                "type": "COMPOSIO_GOOGLE_CALENDAR_CONNECTOR",
+                "sources": [],
+            }, []
+
+        def _title_fn(doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return (
+                doc_info.get("title")
+                or metadata.get("summary")
+                or metadata.get("title")
+                or "Untitled Event"
+            )
+
+        def _url_fn(_doc_info: dict[str, Any], metadata: dict[str, Any]) -> str:
+            return metadata.get("url") or metadata.get("html_link") or ""
+
+        def _description_fn(
+            chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> str:
+            description = self._chunk_preview(chunk.get("content", ""), limit=200)
+            info_parts = []
+            start_time = metadata.get("start_time") or metadata.get("start")
+            end_time = metadata.get("end_time") or metadata.get("end")
+            if start_time:
+                info_parts.append(f"Start: {start_time}")
+            if end_time:
+                info_parts.append(f"End: {end_time}")
+            if info_parts:
+                description = (description + " | " + " | ".join(info_parts)).strip(" |")
+            return description
+
+        def _extra_fields_fn(
+            _chunk: dict[str, Any], _doc_info: dict[str, Any], metadata: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "event_id": metadata.get("event_id", ""),
+                "calendar_id": metadata.get("calendar_id", ""),
+                "start_time": metadata.get("start_time", ""),
+                "end_time": metadata.get("end_time", ""),
+                "location": metadata.get("location", ""),
+            }
+
+        sources_list = self._build_chunk_sources_from_documents(
+            composio_calendar_docs,
+            title_fn=_title_fn,
+            url_fn=_url_fn,
+            description_fn=_description_fn,
+            extra_fields_fn=_extra_fields_fn,
+        )
+
+        # Create result object
+        result_object = {
+            "id": 56,
+            "name": "Google Calendar (Composio)",
+            "type": "COMPOSIO_GOOGLE_CALENDAR_CONNECTOR",
+            "sources": sources_list,
+        }
+
+        return result_object, composio_calendar_docs
+
+    # =========================================================================
+    # Utility Methods for Connector Discovery
+    # =========================================================================
+
+    async def get_available_connectors(
+        self,
+        search_space_id: int,
+    ) -> list[SearchSourceConnectorType]:
+        """
+        Get all available (enabled) connector types for a search space.
+
+        Args:
+            search_space_id: The search space ID
+
+        Returns:
+            List of SearchSourceConnectorType enums for enabled connectors
+        """
+        query = (
+            select(SearchSourceConnector.connector_type)
+            .filter(
+                SearchSourceConnector.search_space_id == search_space_id,
+            )
+            .distinct()
+        )
+
+        result = await self.session.execute(query)
+        connector_types = result.scalars().all()
+        return list(connector_types)
+
+    async def get_available_document_types(
+        self,
+        search_space_id: int,
+    ) -> list[str]:
+        """
+        Get all document types that have at least one document in the search space.
+
+        Args:
+            search_space_id: The search space ID
+
+        Returns:
+            List of document type strings that have documents indexed
+        """
+        from sqlalchemy import distinct
+
+        from app.db import Document
+
+        query = select(distinct(Document.document_type)).filter(
+            Document.search_space_id == search_space_id,
+        )
+
+        result = await self.session.execute(query)
+        doc_types = result.scalars().all()
+        return [str(dt) for dt in doc_types]

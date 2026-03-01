@@ -1,68 +1,11 @@
 import os
 import shutil
 from pathlib import Path
-from typing import Any
 
 import yaml
 from chonkie import AutoEmbeddings, CodeChunker, RecursiveChunker
-from chonkie.embeddings.azure_openai import AzureOpenAIEmbeddings
-from chonkie.embeddings.registry import EmbeddingsRegistry
 from dotenv import load_dotenv
 from rerankers import Reranker
-
-
-# Monkey patch AzureOpenAIEmbeddings to fix parameter order issue
-# This is a temporary workaround until the upstream chonkie library is fixed
-class FixedAzureOpenAIEmbeddings(AzureOpenAIEmbeddings):
-    """Wrapper around AzureOpenAIEmbeddings with fixed parameter order."""
-
-    def __init__(
-        self,
-        model: str = "text-embedding-3-small",
-        azure_endpoint: str | None = None,
-        tokenizer: Any | None = None,
-        dimension: int | None = None,
-        azure_api_key: str | None = None,
-        api_version: str = "2024-10-21",
-        deployment: str | None = None,
-        max_retries: int = 3,
-        timeout: float = 60.0,
-        batch_size: int = 128,
-        **kwargs: dict[str, Any],
-    ):
-        """Initialize with model as first parameter to avoid conflicts."""
-        # Call parent's __init__ by explicitly passing azure_endpoint as first arg
-        # to maintain compatibility with the original signature
-        super().__init__(
-            azure_endpoint=azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT", ""),
-            model=model,
-            tokenizer=tokenizer,
-            dimension=dimension,
-            azure_api_key=azure_api_key,
-            api_version=api_version,
-            deployment=deployment,
-            max_retries=max_retries,
-            timeout=timeout,
-            batch_size=batch_size,
-            **kwargs,
-        )
-
-
-# TODO: Fix this in chonkie upstream
-# Register our fixed Azure OpenAI embeddings with pattern
-# This automatically infers the following arguments from their corresponding environment variables if they are not provided:
-# - `api_key` from `AZURE_OPENAI_API_KEY`
-# - `organization` from `OPENAI_ORG_ID`
-# - `project` from `OPENAI_PROJECT_ID`
-# - `azure_ad_token` from `AZURE_OPENAI_AD_TOKEN`
-# - `api_version` from `OPENAI_API_VERSION`
-# - `azure_endpoint` from `AZURE_OPENAI_ENDPOINT`
-EmbeddingsRegistry.register_provider("azure_openai", FixedAzureOpenAIEmbeddings)
-EmbeddingsRegistry.register_pattern(r"^text-embedding-", FixedAzureOpenAIEmbeddings)
-EmbeddingsRegistry.register_model("text-embedding-ada-002", FixedAzureOpenAIEmbeddings)
-EmbeddingsRegistry.register_model("text-embedding-3-small", FixedAzureOpenAIEmbeddings)
-EmbeddingsRegistry.register_model("text-embedding-3-large", FixedAzureOpenAIEmbeddings)
-
 
 # Get the base directory of the project
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -92,12 +35,6 @@ def load_global_llm_configs():
     # Try main config file first
     global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.yaml"
 
-    # Fall back to example file for testing
-    # if not global_config_file.exists():
-    #     global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.example.yaml"
-    #     if global_config_file.exists():
-    #         print("Info: Using global_llm_config.example.yaml (copy to global_llm_config.yaml for production)")
-
     if not global_config_file.exists():
         # No global configs available
         return []
@@ -109,6 +46,140 @@ def load_global_llm_configs():
     except Exception as e:
         print(f"Warning: Failed to load global LLM configs: {e}")
         return []
+
+
+def load_router_settings():
+    """
+    Load router settings for Auto mode from YAML file.
+    Falls back to default settings if not found.
+
+    Returns:
+        dict: Router settings dictionary
+    """
+    # Default router settings
+    default_settings = {
+        "routing_strategy": "usage-based-routing",
+        "num_retries": 3,
+        "allowed_fails": 3,
+        "cooldown_time": 60,
+    }
+
+    # Try main config file first
+    global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.yaml"
+
+    if not global_config_file.exists():
+        return default_settings
+
+    try:
+        with open(global_config_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            settings = data.get("router_settings", {})
+            # Merge with defaults
+            return {**default_settings, **settings}
+    except Exception as e:
+        print(f"Warning: Failed to load router settings: {e}")
+        return default_settings
+
+
+def load_global_image_gen_configs():
+    """
+    Load global image generation configurations from YAML file.
+
+    Returns:
+        list: List of global image generation config dictionaries, or empty list
+    """
+    global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.yaml"
+
+    if not global_config_file.exists():
+        return []
+
+    try:
+        with open(global_config_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            return data.get("global_image_generation_configs", [])
+    except Exception as e:
+        print(f"Warning: Failed to load global image generation configs: {e}")
+        return []
+
+
+def load_image_gen_router_settings():
+    """
+    Load router settings for image generation Auto mode from YAML file.
+
+    Returns:
+        dict: Router settings dictionary
+    """
+    default_settings = {
+        "routing_strategy": "usage-based-routing",
+        "num_retries": 3,
+        "allowed_fails": 3,
+        "cooldown_time": 60,
+    }
+
+    global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.yaml"
+
+    if not global_config_file.exists():
+        return default_settings
+
+    try:
+        with open(global_config_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            settings = data.get("image_generation_router_settings", {})
+            return {**default_settings, **settings}
+    except Exception as e:
+        print(f"Warning: Failed to load image generation router settings: {e}")
+        return default_settings
+
+
+def initialize_llm_router():
+    """
+    Initialize the LLM Router service for Auto mode.
+    This should be called during application startup.
+    """
+    global_configs = load_global_llm_configs()
+    router_settings = load_router_settings()
+
+    if not global_configs:
+        print("Info: No global LLM configs found, Auto mode will not be available")
+        return
+
+    try:
+        from app.services.llm_router_service import LLMRouterService
+
+        LLMRouterService.initialize(global_configs, router_settings)
+        print(
+            f"Info: LLM Router initialized with {len(global_configs)} models "
+            f"(strategy: {router_settings.get('routing_strategy', 'usage-based-routing')})"
+        )
+    except Exception as e:
+        print(f"Warning: Failed to initialize LLM Router: {e}")
+
+
+def initialize_image_gen_router():
+    """
+    Initialize the Image Generation Router service for Auto mode.
+    This should be called during application startup.
+    """
+    image_gen_configs = load_global_image_gen_configs()
+    router_settings = load_image_gen_router_settings()
+
+    if not image_gen_configs:
+        print(
+            "Info: No global image generation configs found, "
+            "Image Generation Auto mode will not be available"
+        )
+        return
+
+    try:
+        from app.services.image_gen_router_service import ImageGenRouterService
+
+        ImageGenRouterService.initialize(image_gen_configs, router_settings)
+        print(
+            f"Info: Image Generation Router initialized with {len(image_gen_configs)} models "
+            f"(strategy: {router_settings.get('routing_strategy', 'usage-based-routing')})"
+        )
+    except Exception as e:
+        print(f"Warning: Failed to initialize Image Generation Router: {e}")
 
 
 class Config:
@@ -124,8 +195,34 @@ class Config:
                 "FFmpeg is not installed on the system. Please install it to use the Surfsense Podcaster."
             )
 
+    # Deployment Mode (self-hosted or cloud)
+    # self-hosted: Full access to local file system connectors (Obsidian, etc.)
+    # cloud: Only cloud-based connectors available
+    DEPLOYMENT_MODE = os.getenv("SURFSENSE_DEPLOYMENT_MODE", "self-hosted")
+
+    @classmethod
+    def is_self_hosted(cls) -> bool:
+        """Check if running in self-hosted mode."""
+        return cls.DEPLOYMENT_MODE == "self-hosted"
+
+    @classmethod
+    def is_cloud(cls) -> bool:
+        """Check if running in cloud mode."""
+        return cls.DEPLOYMENT_MODE == "cloud"
+
     # Database
     DATABASE_URL = os.getenv("DATABASE_URL")
+
+    # Celery / Redis
+    CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+    CELERY_RESULT_BACKEND = os.getenv(
+        "CELERY_RESULT_BACKEND", "redis://localhost:6379/0"
+    )
+    CELERY_TASK_DEFAULT_QUEUE = os.getenv("CELERY_TASK_DEFAULT_QUEUE", "surfsense")
+    REDIS_APP_URL = os.getenv("REDIS_APP_URL", CELERY_BROKER_URL)
+    CONNECTOR_INDEXING_LOCK_TTL_SECONDS = int(
+        os.getenv("CONNECTOR_INDEXING_LOCK_TTL_SECONDS", str(8 * 60 * 60))
+    )
 
     NEXT_FRONTEND_URL = os.getenv("NEXT_FRONTEND_URL")
     # Backend URL to override the http to https in the OAuth redirect URI
@@ -145,10 +242,56 @@ class Config:
     # Google Gmail redirect URI
     GOOGLE_GMAIL_REDIRECT_URI = os.getenv("GOOGLE_GMAIL_REDIRECT_URI")
 
+    # Google Drive redirect URI
+    GOOGLE_DRIVE_REDIRECT_URI = os.getenv("GOOGLE_DRIVE_REDIRECT_URI")
+
     # Airtable OAuth
     AIRTABLE_CLIENT_ID = os.getenv("AIRTABLE_CLIENT_ID")
     AIRTABLE_CLIENT_SECRET = os.getenv("AIRTABLE_CLIENT_SECRET")
     AIRTABLE_REDIRECT_URI = os.getenv("AIRTABLE_REDIRECT_URI")
+
+    # Notion OAuth
+    NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID")
+    NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET")
+    NOTION_REDIRECT_URI = os.getenv("NOTION_REDIRECT_URI")
+
+    # Atlassian OAuth (shared for Jira and Confluence)
+    ATLASSIAN_CLIENT_ID = os.getenv("ATLASSIAN_CLIENT_ID")
+    ATLASSIAN_CLIENT_SECRET = os.getenv("ATLASSIAN_CLIENT_SECRET")
+    JIRA_REDIRECT_URI = os.getenv("JIRA_REDIRECT_URI")
+    CONFLUENCE_REDIRECT_URI = os.getenv("CONFLUENCE_REDIRECT_URI")
+
+    # Linear OAuth
+    LINEAR_CLIENT_ID = os.getenv("LINEAR_CLIENT_ID")
+    LINEAR_CLIENT_SECRET = os.getenv("LINEAR_CLIENT_SECRET")
+    LINEAR_REDIRECT_URI = os.getenv("LINEAR_REDIRECT_URI")
+
+    # Slack OAuth
+    SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+    SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+    SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
+
+    # Discord OAuth
+    DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+    DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+    DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
+    DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+    # Microsoft Teams OAuth
+    TEAMS_CLIENT_ID = os.getenv("TEAMS_CLIENT_ID")
+    TEAMS_CLIENT_SECRET = os.getenv("TEAMS_CLIENT_SECRET")
+    TEAMS_REDIRECT_URI = os.getenv("TEAMS_REDIRECT_URI")
+
+    # ClickUp OAuth
+    CLICKUP_CLIENT_ID = os.getenv("CLICKUP_CLIENT_ID")
+    CLICKUP_CLIENT_SECRET = os.getenv("CLICKUP_CLIENT_SECRET")
+    CLICKUP_REDIRECT_URI = os.getenv("CLICKUP_REDIRECT_URI")
+
+    # Composio Configuration (for managed OAuth integrations)
+    # Get your API key from https://app.composio.dev
+    COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")
+    COMPOSIO_ENABLED = os.getenv("COMPOSIO_ENABLED", "FALSE").upper() == "TRUE"
+    COMPOSIO_REDIRECT_URI = os.getenv("COMPOSIO_REDIRECT_URI")
 
     # LLM instances are now managed per-user through the LLMConfig system
     # Legacy environment variables removed in favor of user-specific configurations
@@ -157,6 +300,15 @@ class Config:
     # Load from global_llm_config.yaml if available
     # These can be used as default options for users
     GLOBAL_LLM_CONFIGS = load_global_llm_configs()
+
+    # Router settings for Auto mode (LiteLLM Router load balancing)
+    ROUTER_SETTINGS = load_router_settings()
+
+    # Global Image Generation Configurations (optional)
+    GLOBAL_IMAGE_GEN_CONFIGS = load_global_image_gen_configs()
+
+    # Router settings for Image Generation Auto mode
+    IMAGE_GEN_ROUTER_SETTINGS = load_image_gen_router_settings()
 
     # Chonkie Configuration | Edit this to your needs
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
@@ -182,7 +334,7 @@ class Config:
         chunk_size=getattr(embedding_model_instance, "max_seq_length", 512)
     )
 
-    # Reranker's Configuration | Pinecode, Cohere etc. Read more at https://github.com/AnswerDotAI/rerankers?tab=readme-ov-file#usage
+    # Reranker's Configuration | Pinecone, Cohere etc. Read more at https://github.com/AnswerDotAI/rerankers?tab=readme-ov-file#usage
     RERANKERS_ENABLED = os.getenv("RERANKERS_ENABLED", "FALSE").upper() == "TRUE"
     if RERANKERS_ENABLED:
         RERANKERS_MODEL_NAME = os.getenv("RERANKERS_MODEL_NAME")
@@ -197,8 +349,19 @@ class Config:
     # OAuth JWT
     SECRET_KEY = os.getenv("SECRET_KEY")
 
+    # JWT Token Lifetimes
+    ACCESS_TOKEN_LIFETIME_SECONDS = int(
+        os.getenv("ACCESS_TOKEN_LIFETIME_SECONDS", str(24 * 60 * 60))  # 1 day
+    )
+    REFRESH_TOKEN_LIFETIME_SECONDS = int(
+        os.getenv("REFRESH_TOKEN_LIFETIME_SECONDS", str(14 * 24 * 60 * 60))  # 2 weeks
+    )
+
     # ETL Service
     ETL_SERVICE = os.getenv("ETL_SERVICE")
+
+    # Pages limit for ETL services (default to very high number for OSS unlimited usage)
+    PAGES_LIMIT = int(os.getenv("PAGES_LIMIT", "999999999"))
 
     if ETL_SERVICE == "UNSTRUCTURED":
         # Unstructured API Key
@@ -207,6 +370,14 @@ class Config:
     elif ETL_SERVICE == "LLAMACLOUD":
         # LlamaCloud API Key
         LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
+
+    # Residential Proxy Configuration (anonymous-proxies.net)
+    # Used for web crawling and YouTube transcript fetching to avoid IP bans.
+    RESIDENTIAL_PROXY_USERNAME = os.getenv("RESIDENTIAL_PROXY_USERNAME")
+    RESIDENTIAL_PROXY_PASSWORD = os.getenv("RESIDENTIAL_PROXY_PASSWORD")
+    RESIDENTIAL_PROXY_HOSTNAME = os.getenv("RESIDENTIAL_PROXY_HOSTNAME")
+    RESIDENTIAL_PROXY_LOCATION = os.getenv("RESIDENTIAL_PROXY_LOCATION", "")
+    RESIDENTIAL_PROXY_TYPE = int(os.getenv("RESIDENTIAL_PROXY_TYPE", "1"))
 
     # Litellm TTS Configuration
     TTS_SERVICE = os.getenv("TTS_SERVICE")

@@ -1,364 +1,170 @@
+<a href="https://www.surfsense.com/"><img width="1584" height="396" alt="readme_banner" src="https://github.com/user-attachments/assets/9361ef58-1753-4b6e-b275-5020d8847261" /></a>
 
-![new_header](https://github.com/user-attachments/assets/e236b764-0ddc-42ff-a1f1-8fbb3d2e0e65)
 
 
 <div align="center">
 <a href="https://discord.gg/ejRNvftDp9">
 <img src="https://img.shields.io/discord/1359368468260192417" alt="Discord">
 </a>
+<a href="https://www.reddit.com/r/SurfSense/">
+<img src="https://img.shields.io/reddit/subreddit-subscribers/SurfSense?style=social" alt="Reddit">
+</a>
 </div>
 
 <div align="center">
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [Español](README.es.md) | [Português](README.pt-BR.md) | [हिन्दी](README.hi.md) | [简体中文](README.zh-CN.md)
 
 </div>
-
-# SurfSense
-
-虽然像 NotebookLM 和 Perplexity 这样的工具在对任何主题/查询进行研究时令人印象深刻且非常有效，但 SurfSense 通过与您的个人知识库集成，将这一能力提升到了新的高度。它是一个高度可定制的 AI 研究助手，可以连接外部数据源，如搜索引擎（SearxNG、Tavily、LinkUp）、Slack、Linear、Jira、ClickUp、Confluence、Gmail、Notion、YouTube、GitHub、Discord、Airtable、Google Calendar、Luma、Elasticsearch 等，未来还会支持更多。
-
 <div align="center">
 <a href="https://trendshift.io/repositories/13606" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13606" alt="MODSetter%2FSurfSense | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
 
+# SurfSense
+将任何 LLM 连接到您的内部知识源，并与团队成员实时聊天。NotebookLM、Perplexity 和 Glean 的开源替代方案。
 
-# 视频演示
+SurfSense 是一个高度可定制的 AI 研究助手，可以连接外部数据源，如搜索引擎（SearxNG、Tavily、LinkUp）、Google Drive、Slack、Microsoft Teams、Linear、Jira、ClickUp、Confluence、BookStack、Gmail、Notion、YouTube、GitHub、Discord、Airtable、Google Calendar、Luma、Circleback、Elasticsearch、Obsidian 等，未来还会支持更多。
 
 
-https://github.com/user-attachments/assets/d9221908-e0de-4b2f-ac3a-691cf4b202da
 
+# 视频 
+
+https://github.com/user-attachments/assets/cc0c84d3-1f2f-4f7a-b519-2ecce22310b1
 
 ## 播客示例
 
 https://github.com/user-attachments/assets/a0a16566-6967-4374-ac51-9b3e07fbecd7
 
 
+## 如何使用 SurfSense
 
+### Cloud
+
+1. 访问 [surfsense.com](https://www.surfsense.com) 并登录。
+
+<p align="center"><img src="https://github.com/user-attachments/assets/b4df25fe-db5a-43c2-9462-b75cf7f1b707" alt="登录" /></p>
+
+2. 连接您的连接器并同步。启用定期同步以保持连接器数据更新。
+
+<p align="center"><img src="https://github.com/user-attachments/assets/59da61d7-da05-4576-b7c0-dbc09f5985e8" alt="连接器" /></p>
+
+3. 在连接器数据索引期间，上传文档。
+
+<p align="center"><img src="https://github.com/user-attachments/assets/d1e8b2e2-9eac-41d8-bdc0-f0cdc405d128" alt="上传文档" /></p>
+
+4. 一切索引完成后，尽管提问（使用场景）：
+
+   - 基本搜索和引用
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/81e797a1-e01a-4003-8e60-0a0b3a9789df" alt="搜索和引用" /></p>
+
+   - 文档提及问答
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/be958295-0a8c-4707-998c-9fe1f1c007be" alt="文档提及问答" /></p>
+
+   - 报告生成和导出（目前支持 PDF、DOCX）
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/9836b7d6-57c9-4951-b61c-68202c9b6ace" alt="报告生成" /></p>
+
+   - 播客生成
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/58c9b057-8848-4e81-aaba-d2c617985d8c" alt="播客生成" /></p>
+
+   - 图像生成
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/25f94cb3-18f8-4854-afd9-27b7bfd079cb" alt="图像生成" /></p>
+
+   - 更多功能即将推出。
+
+
+### 自托管
+
+在您自己的基础设施上运行 SurfSense，实现完全的数据控制和隐私保护。
+
+**快速开始（Docker 一行命令）：**
+
+```bash
+docker run -d -p 3000:3000 -p 8000:8000 -p 5133:5133 -v surfsense-data:/data --name surfsense --restart unless-stopped ghcr.io/modsetter/surfsense:latest
+```
+
+启动后，在浏览器中打开 [http://localhost:3000](http://localhost:3000)。
+
+如需 Docker Compose、手动安装及其他部署方式，请查看[文档](https://www.surfsense.com/docs/)。
+
+### 如何实时协作（Beta）
+
+1. 前往成员管理页面并创建邀请。
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/40ed7683-5aa6-48a0-a3df-00575528c392" alt="邀请成员" /></p>
+
+2. 队友加入后，该 SearchSpace 变为共享。
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/ea4e1057-4d2b-4fd2-9ca0-cd19286a285e" alt="邀请加入流程" /></p>
+
+3. 将聊天设为共享。
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/17b93904-0888-4c3a-ac12-51a24a8ea26a" alt="设为共享聊天" /></p>
+
+4. 您的团队现在可以实时聊天。
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/83803ac2-fbce-4d93-aae3-85eb85a3053a" alt="实时聊天" /></p>
+
+5. 添加评论以标记队友。
+
+   <p align="center"><img src="https://github.com/user-attachments/assets/3b04477d-8f42-4baa-be95-867c1eaeba87" alt="实时评论" /></p>
 
 ## 核心功能
 
-### 💡 **理念**: 
-- 拥有您自己的高度可定制的私有 NotebookLM 和 Perplexity，并与外部数据源集成。
+| 功能 | 描述 |
+|------|------|
+| 开源替代方案 | 支持实时团队协作的 NotebookLM、Perplexity 和 Glean 替代品 |
+| 50+ 文件格式 | 通过 LlamaCloud、Unstructured 或 Docling（本地）上传文档、图像、视频 |
+| 混合搜索 | 语义搜索 + 全文搜索，结合层次化索引和倒数排名融合 |
+| 引用回答 | 与知识库对话，获得 Perplexity 风格的引用回答 |
+| 深度代理架构 | 基于 [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview) 构建，支持规划、子代理和文件系统访问 |
+| 通用 LLM 支持 | 100+ LLM、6000+ 嵌入模型、所有主流重排序器，通过 OpenAI spec 和 LiteLLM |
+| 隐私优先 | 完整本地 LLM 支持（vLLM、Ollama），您的数据由您掌控 |
+| 团队协作 | RBAC 角色控制（所有者/管理员/编辑者/查看者），实时聊天和评论线程 |
+| 播客生成 | 20 秒内生成 3 分钟播客；多种 TTS 提供商（OpenAI、Azure、Kokoro） |
+| 浏览器扩展 | 跨浏览器扩展，保存任何网页，包括需要身份验证的页面 |
+| 25+ 连接器 | 搜索引擎、Google Drive、Slack、Teams、Jira、Notion、GitHub、Discord 等[更多](#外部数据源) |
+| 可自托管 | 开源，Docker 一行命令或完整 Docker Compose 用于生产环境 |
 
-### 📁 **支持多种文件格式上传**
-- 将您个人文件中的内容（文档、图像、视频，支持 **50+ 种文件扩展名**）保存到您自己的个人知识库。
+<details>
+<summary><b>外部数据源完整列表</b></summary>
+<a id="外部数据源"></a>
 
-### 🔍 **强大的搜索功能**
-- 快速研究或查找已保存内容中的任何信息。
+搜索引擎（Tavily、LinkUp）· SearxNG · Google Drive · Slack · Microsoft Teams · Linear · Jira · ClickUp · Confluence · BookStack · Notion · Gmail · YouTube 视频 · GitHub · Discord · Airtable · Google Calendar · Luma · Circleback · Elasticsearch · Obsidian，更多即将推出。
 
-### 💬 **与已保存内容对话**
-- 使用自然语言交互并获得引用答案。
-
-### 📄 **引用答案**
-- 像 Perplexity 一样获得带引用的答案。
-
-### 🔔 **隐私保护与本地 LLM 支持**
-- 完美支持 Ollama 本地大语言模型。
-
-### 🏠 **可自托管**
-- 开源且易于本地部署。
-
-### 👥 **团队协作与 RBAC**
-- 搜索空间的基于角色的访问控制
-- 使用可自定义的角色（所有者、管理员、编辑者、查看者）邀请团队成员
-- 对文档、聊天、连接器和设置的细粒度权限控制
-- 在组织内安全共享知识库
-
-### 🎙️ **播客功能**
-- 超快速播客生成代理（在 20 秒内创建 3 分钟播客）
-- 将聊天对话转换为引人入胜的音频内容
-- 支持本地 TTS 提供商（Kokoro TTS）
-- 支持多个 TTS 提供商（OpenAI、Azure、Google Vertex AI）
-
-### 📊 **先进的 RAG 技术**
-- 支持 100+ 种大语言模型
-- 支持 6000+ 种嵌入模型
-- 支持所有主流重排序器（Pinecode、Cohere、Flashrank 等）
-- 使用层次化索引（2 层 RAG 设置）
-- 利用混合搜索（语义搜索 + 全文搜索，结合倒数排名融合）
-
-### ℹ️ **外部数据源**
-- 搜索引擎（Tavily、LinkUp）
-- SearxNG（自托管实例）
-- Slack
-- Linear
-- Jira
-- ClickUp
-- Confluence
-- Notion
-- Gmail
-- YouTube 视频
-- GitHub
-- Discord
-- Airtable
-- Google Calendar
-- Luma
-- Elasticsearch
-- 更多即将推出......
-
-## 📄 **支持的文件扩展名**
-
-> **注意**：文件格式支持取决于您的 ETL 服务配置。LlamaCloud 支持 50+ 种格式，Unstructured 支持 34+ 种核心格式，Docling 支持核心格式（本地处理、注重隐私、无需 API 密钥）。
-
-### 文档与文本
-**LlamaCloud**: `.pdf`, `.doc`, `.docx`, `.docm`, `.dot`, `.dotm`, `.rtf`, `.txt`, `.xml`, `.epub`, `.odt`, `.wpd`, `.pages`, `.key`, `.numbers`, `.602`, `.abw`, `.cgm`, `.cwk`, `.hwp`, `.lwp`, `.mw`, `.mcw`, `.pbd`, `.sda`, `.sdd`, `.sdp`, `.sdw`, `.sgl`, `.sti`, `.sxi`, `.sxw`, `.stw`, `.sxg`, `.uof`, `.uop`, `.uot`, `.vor`, `.wps`, `.zabw`
-
-**Unstructured**: `.doc`, `.docx`, `.odt`, `.rtf`, `.pdf`, `.xml`, `.txt`, `.md`, `.markdown`, `.rst`, `.html`, `.org`, `.epub`
-
-**Docling**: `.pdf`, `.docx`, `.html`, `.htm`, `.xhtml`, `.adoc`, `.asciidoc`
-
-### 演示文稿
-**LlamaCloud**: `.ppt`, `.pptx`, `.pptm`, `.pot`, `.potm`, `.potx`, `.odp`, `.key`
-
-**Unstructured**: `.ppt`, `.pptx`
-
-**Docling**: `.pptx`
-
-### 电子表格与数据
-**LlamaCloud**: `.xlsx`, `.xls`, `.xlsm`, `.xlsb`, `.xlw`, `.csv`, `.tsv`, `.ods`, `.fods`, `.numbers`, `.dbf`, `.123`, `.dif`, `.sylk`, `.slk`, `.prn`, `.et`, `.uos1`, `.uos2`, `.wk1`, `.wk2`, `.wk3`, `.wk4`, `.wks`, `.wq1`, `.wq2`, `.wb1`, `.wb2`, `.wb3`, `.qpw`, `.xlr`, `.eth`
-
-**Unstructured**: `.xls`, `.xlsx`, `.csv`, `.tsv`
-
-**Docling**: `.xlsx`, `.csv`
-
-### 图像
-**LlamaCloud**: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.svg`, `.tiff`, `.webp`, `.html`, `.htm`, `.web`
-
-**Unstructured**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.heic`
-
-**Docling**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.tif`, `.webp`
-
-### 音频与视频 **（始终支持）**
-`.mp3`, `.mpga`, `.m4a`, `.wav`, `.mp4`, `.mpeg`, `.webm`
-
-### 电子邮件与通讯
-**Unstructured**: `.eml`, `.msg`, `.p7s`
-
-### 🔖 **跨浏览器扩展**
-- SurfSense 扩展可用于保存您喜欢的任何网页
-- 主要用途是保存需要身份验证的受保护网页
-
+</details>
 
 
 ## 功能请求与未来规划
+
 
 **SurfSense 正在积极开发中。** 虽然它还未达到生产就绪状态，但您可以帮助我们加快进度。
 
 加入 [SurfSense Discord](https://discord.gg/ejRNvftDp9) 一起塑造 SurfSense 的未来！
 
-## 🚀 路线图
+## 路线图
 
 随时了解我们的开发进度和即将推出的功能！  
 查看我们的公开路线图并贡献您的想法或反馈：
 
-**查看路线图：** [SurfSense 路线图 (GitHub Projects)](https://github.com/users/MODSetter/projects/2)
+**路线图讨论：** [SurfSense 2026 Roadmap](https://github.com/MODSetter/SurfSense/discussions/565)
 
-
-## 如何开始？
-
-### 使用 Docker 快速开始 🐳
-
-> [!TIP]
-> 对于生产部署，请使用完整的 [Docker Compose 设置](https://www.surfsense.com/docs/docker-installation)，它提供更多控制和可扩展性。
-
-**Linux/macOS:**
-
-```bash
-docker run -d -p 3000:3000 -p 8000:8000 \
-  -v surfsense-data:/data \
-  --name surfsense \
-  --restart unless-stopped \
-  ghcr.io/modsetter/surfsense:latest
-```
-
-**Windows (PowerShell):**
-
-```powershell
-docker run -d -p 3000:3000 -p 8000:8000 `
-  -v surfsense-data:/data `
-  --name surfsense `
-  --restart unless-stopped `
-  ghcr.io/modsetter/surfsense:latest
-```
-
-**使用自定义配置（例如 OpenAI 嵌入）：**
-
-```bash
-docker run -d -p 3000:3000 -p 8000:8000 \
-  -v surfsense-data:/data \
-  -e EMBEDDING_MODEL=openai://text-embedding-ada-002 \
-  -e OPENAI_API_KEY=your_openai_api_key \
-  --name surfsense \
-  --restart unless-stopped \
-  ghcr.io/modsetter/surfsense:latest
-```
-
-启动后，访问 SurfSense：
-- **前端**: [http://localhost:3000](http://localhost:3000)
-- **后端 API**: [http://localhost:8000](http://localhost:8000)
-- **API 文档**: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-**常用命令：**
-
-```bash
-docker logs -f surfsense      # 查看日志
-docker stop surfsense         # 停止
-docker start surfsense        # 启动
-docker rm surfsense           # 删除（数据保留在卷中）
-```
-
-### 安装选项
-
-SurfSense 提供多种入门方式：
-
-1. **[SurfSense Cloud](https://www.surfsense.com/login)** - 无需任何设置即可试用 SurfSense 的最简单方法。
-   - 无需安装
-   - 即时访问所有功能
-   - 非常适合快速上手
-
-2. **快速启动 Docker（上述方法）** - 一条命令即可在本地运行 SurfSense。
-   - 一体化镜像，捆绑 PostgreSQL、Redis 和所有服务
-   - 非常适合评估、开发和小型部署
-   - 数据通过 Docker 卷持久化
-
-3. **[Docker Compose（生产环境）](https://www.surfsense.com/docs/docker-installation)** - 使用独立服务进行完整堆栈部署。
-   - 包含 pgAdmin，通过 Web UI 进行数据库管理
-   - 支持通过 `.env` 文件自定义环境变量
-   - 灵活的部署选项（完整堆栈或仅核心服务）
-   - 更适合生产环境，支持独立扩展服务
-
-4. **[手动安装](https://www.surfsense.com/docs/manual-installation)** - 适合希望对设置有更多控制或需要自定义部署的用户。
-
-Docker 和手动安装指南都包含适用于 Windows、macOS 和 Linux 的详细操作系统特定说明。
-
-在自托管安装之前，请确保完成[先决条件设置步骤](https://www.surfsense.com/docs/)，包括：
-- 身份验证设置（可选 - 默认为 LOCAL 身份验证）
-- **文件处理 ETL 服务**（可选 - 默认为 Docling）：
-  - Docling（默认，本地处理，无需 API 密钥，支持 PDF、Office 文档、图像、HTML、CSV）
-  - Unstructured.io API 密钥（支持 34+ 种格式）
-  - LlamaIndex API 密钥（增强解析，支持 50+ 种格式）
-- 其他根据用例需要的 API 密钥
-
-## 截图
-
-**研究助手** 
-
-![updated_researcher](https://github.com/user-attachments/assets/e22c5d86-f511-4c72-8c50-feba0c1561b4)
-
-**搜索空间** 
-
-![search_spaces](https://github.com/user-attachments/assets/e254c38c-f937-44b6-9e9d-770db583d099)
-
-**管理文档** 
-![documents](https://github.com/user-attachments/assets/7001e306-eb06-4009-89c6-8fadfdc3fc4d)
-
-**播客助手** 
-![podcasts](https://github.com/user-attachments/assets/6cb82ffd-9e14-4172-bc79-67faf34c4c1c)
-
-
-**对话助手** 
-
-![git_chat](https://github.com/user-attachments/assets/bb352d52-1c6d-4020-926b-722d0b98b491)
-
-**浏览器扩展**
-
-![ext1](https://github.com/user-attachments/assets/1f042b7a-6349-422b-94fb-d40d0df16c40)
-
-![ext2](https://github.com/user-attachments/assets/a9b9f1aa-2677-404d-b0a0-c1b2dddf24a7)
-
-
-## 技术栈
-
-
- ### **后端** 
-
--  **FastAPI**：现代、快速的 Python Web 框架，用于构建 API
-  
--  **PostgreSQL with pgvector**：具有向量搜索功能的数据库，用于相似性搜索
-
--  **SQLAlchemy**：SQL 工具包和 ORM（对象关系映射），用于数据库交互
-
--  **Alembic**：SQLAlchemy 的数据库迁移工具
-
--  **FastAPI Users**：使用 JWT 和 OAuth 支持的身份验证和用户管理
-
--  **LangGraph**：用于开发 AI 代理的框架
-  
--  **LangChain**：用于开发 AI 驱动应用程序的框架
-
--  **LLM 集成**：通过 LiteLLM 与大语言模型集成
-
--  **Rerankers**：先进的结果排序，提高搜索相关性
-
--  **混合搜索**：结合向量相似性和全文搜索，使用倒数排名融合 (RRF) 获得最佳结果
-
--  **向量嵌入**：文档和文本嵌入，用于语义搜索
-
--  **pgvector**：PostgreSQL 扩展，用于高效的向量相似性操作
-
--  **Redis**：内存数据结构存储，用作 Celery 的消息代理和结果后端
-
--  **Celery**：分布式任务队列，用于处理异步后台任务（文档处理、播客生成等）
-
--  **Flower**：Celery 任务队列的实时监控和管理工具
-
--  **Chonkie**：先进的文档分块和嵌入库
- - 使用 `AutoEmbeddings` 灵活选择嵌入模型
- -  `LateChunker` 基于嵌入模型的最大序列长度优化文档分块
-
-  
----
- ### **前端**
-
--  **Next.js 15.2.3**：React 框架，具有应用路由器、服务器组件、自动代码拆分和优化渲染功能
-
--  **React 19.0.0**：用于构建用户界面的 JavaScript 库
-
--  **TypeScript**：JavaScript 的静态类型检查，提升代码质量和开发体验
-
-- **Vercel AI SDK Kit UI Stream Protocol**：创建可扩展的聊天 UI
-
--  **Tailwind CSS 4.x**：实用优先的 CSS 框架，用于构建自定义 UI 设计
-
--  **Shadcn**：无头组件库
-
--  **Lucide React**：作为 React 组件实现的图标集
-
--  **Framer Motion**：React 动画库
-
--  **Sonner**：Toast 通知库
-
--  **Geist**：Vercel 的字体系列
-
--  **React Hook Form**：表单状态管理和验证
-
--  **Zod**：TypeScript 优先的模式验证，带静态类型推断
-
--  **@hookform/resolvers**：用于在 React Hook Form 中使用验证库的解析器
-
--  **@tanstack/react-table**：用于构建强大表格和数据网格的无头 UI
-
-
- ### **DevOps**
-
--  **Docker**：容器平台，用于跨环境的一致部署
-  
--  **Docker Compose**：用于定义和运行多容器 Docker 应用程序的工具
-
--  **pgAdmin**：Docker 设置中包含的基于 Web 的 PostgreSQL 管理工具
-
-
-### **扩展** 
-基于 Plasmo 的 Manifest v3
+**看板：** [SurfSense Project Board](https://github.com/users/MODSetter/projects/3)
 
 
 ## 贡献
 
-非常欢迎贡献！贡献可以小到一个 ⭐，甚至是发现和创建问题。
-后端的微调总是受欢迎的。
+欢迎所有贡献，从 Star 和 Bug 报告到后端改进。请参阅 [CONTRIBUTING.md](CONTRIBUTING.md) 开始贡献。
 
-有关详细的贡献指南，请参阅我们的 [CONTRIBUTING.md](CONTRIBUTING.md) 文件。
+感谢所有 Surfers:
+
+<a href="https://github.com/MODSetter/SurfSense/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=MODSetter/SurfSense" />
+</a>
 
 ## Star 历史
 

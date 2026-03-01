@@ -19,7 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     dos2unix \
+    git \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Pandoc 3.x from GitHub as a fallback for Linux where pypandoc_binary
+# may not bundle pandoc (apt ships 2.17 which has broken table rendering).
+# pypandoc_binary bundles pandoc on Windows/macOS; on Linux it picks this up.
+RUN ARCH=$(dpkg --print-architecture) && \
+    wget -qO /tmp/pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.9/pandoc-3.9-1-${ARCH}.deb" && \
+    dpkg -i /tmp/pandoc.deb && \
+    rm /tmp/pandoc.deb
 
 # Update certificates and install SSL tools
 RUN update-ca-certificates
@@ -59,7 +68,7 @@ RUN python -c "try:\n    from docling.document_converter import DocumentConverte
 
 # Install Playwright browsers for web scraping if needed
 RUN pip install playwright && \
-    playwright install chromium
+    playwright install chromium --with-deps
 
 # Copy source code
 COPY . .
@@ -69,10 +78,40 @@ COPY . .
 COPY scripts/docker/entrypoint.sh /app/scripts/docker/entrypoint.sh
 RUN dos2unix /app/scripts/docker/entrypoint.sh && chmod +x /app/scripts/docker/entrypoint.sh
 
+# Shared temp directory for file uploads between API and Worker containers.
+# Python's tempfile module uses TMPDIR, so uploaded files land here.
+# Mount the SAME volume at /shared_tmp on both API and Worker in Coolify.
+RUN mkdir -p /shared_tmp
+ENV TMPDIR=/shared_tmp
+
 # Prevent uvloop compatibility issues
 ENV PYTHONPATH=/app
 ENV UVICORN_LOOP=asyncio
 
+# Tune glibc malloc to return freed memory to the OS more aggressively.
+# Without these, Python's gc.collect() frees objects but the underlying
+# C heap pages stay mapped (RSS never drops) due to sbrk fragmentation.
+ENV MALLOC_MMAP_THRESHOLD_=65536
+ENV MALLOC_TRIM_THRESHOLD_=131072
+ENV MALLOC_MMAP_MAX_=65536
+
+# SERVICE_ROLE controls which process this container runs:
+#   api     – FastAPI backend only (runs migrations on startup)
+#   worker  – Celery worker only
+#   beat    – Celery beat scheduler only
+#   all     – All three (legacy / dev default)
+ENV SERVICE_ROLE=all
+
+# Celery worker tuning (only used when SERVICE_ROLE=worker or all)
+ENV CELERY_MAX_WORKERS=10
+ENV CELERY_MIN_WORKERS=2
+ENV CELERY_MAX_TASKS_PER_CHILD=50
+# CELERY_QUEUES: comma-separated queues to consume (empty = all queues)
+#   "surfsense"              – fast tasks only (file uploads, podcasts, etc.)
+#   "surfsense.connectors"   – slow connector indexing tasks only
+#   ""                       – both queues (default, for single-worker setups)
+ENV CELERY_QUEUES=""
+
 # Run
 EXPOSE 8000-8001
-CMD ["/app/scripts/docker/entrypoint.sh"] 
+CMD ["/app/scripts/docker/entrypoint.sh"]

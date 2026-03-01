@@ -1,3 +1,11 @@
+import time
+from datetime import datetime
+
+from app.utils.perf import get_perf_logger
+
+_MAX_FETCH_CHUNKS_PER_DOC = 30
+
+
 class ChucksHybridSearchRetriever:
     def __init__(self, db_session):
         """
@@ -13,6 +21,8 @@ class ChucksHybridSearchRetriever:
         query_text: str,
         top_k: int,
         search_space_id: int,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> list:
         """
         Perform vector similarity search on chunks.
@@ -21,6 +31,8 @@ class ChucksHybridSearchRetriever:
             query_text: The search query text
             top_k: Number of results to return
             search_space_id: The search space ID to search within
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             List of chunks sorted by vector similarity
@@ -31,9 +43,17 @@ class ChucksHybridSearchRetriever:
         from app.config import config
         from app.db import Chunk, Document
 
+        perf = get_perf_logger()
+        t0 = time.perf_counter()
+
         # Get embedding for the query
         embedding_model = config.embedding_model_instance
+        t_embed = time.perf_counter()
         query_embedding = embedding_model.embed(query_text)
+        perf.debug(
+            "[chunk_search] vector_search embedding in %.3fs",
+            time.perf_counter() - t_embed,
+        )
 
         # Build the query filtered by search space
         query = (
@@ -43,12 +63,26 @@ class ChucksHybridSearchRetriever:
             .where(Document.search_space_id == search_space_id)
         )
 
+        # Add time-based filtering if provided
+        if start_date is not None:
+            query = query.where(Document.updated_at >= start_date)
+        if end_date is not None:
+            query = query.where(Document.updated_at <= end_date)
+
         # Add vector similarity ordering
         query = query.order_by(Chunk.embedding.op("<=>")(query_embedding)).limit(top_k)
 
         # Execute the query
+        t_db = time.perf_counter()
         result = await self.db_session.execute(query)
         chunks = result.scalars().all()
+        perf.info(
+            "[chunk_search] vector_search DB query in %.3fs results=%d (total %.3fs) space=%d",
+            time.perf_counter() - t_db,
+            len(chunks),
+            time.perf_counter() - t0,
+            search_space_id,
+        )
 
         return chunks
 
@@ -57,6 +91,8 @@ class ChucksHybridSearchRetriever:
         query_text: str,
         top_k: int,
         search_space_id: int,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
     ) -> list:
         """
         Perform full-text keyword search on chunks.
@@ -65,6 +101,8 @@ class ChucksHybridSearchRetriever:
             query_text: The search query text
             top_k: Number of results to return
             search_space_id: The search space ID to search within
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
 
         Returns:
             List of chunks sorted by text relevance
@@ -73,6 +111,9 @@ class ChucksHybridSearchRetriever:
         from sqlalchemy.orm import joinedload
 
         from app.db import Chunk, Document
+
+        perf = get_perf_logger()
+        t0 = time.perf_counter()
 
         # Create tsvector and tsquery for PostgreSQL full-text search
         tsvector = func.to_tsvector("english", Chunk.content)
@@ -89,12 +130,24 @@ class ChucksHybridSearchRetriever:
             )  # Only include results that match the query
         )
 
+        # Add time-based filtering if provided
+        if start_date is not None:
+            query = query.where(Document.updated_at >= start_date)
+        if end_date is not None:
+            query = query.where(Document.updated_at <= end_date)
+
         # Add text search ranking
         query = query.order_by(func.ts_rank_cd(tsvector, tsquery).desc()).limit(top_k)
 
         # Execute the query
         result = await self.db_session.execute(query)
         chunks = result.scalars().all()
+        perf.info(
+            "[chunk_search] full_text_search in %.3fs results=%d space=%d",
+            time.perf_counter() - t0,
+            len(chunks),
+            search_space_id,
+        )
 
         return chunks
 
@@ -104,18 +157,31 @@ class ChucksHybridSearchRetriever:
         top_k: int,
         search_space_id: int,
         document_type: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        query_embedding: list | None = None,
     ) -> list:
         """
-        Combine vector similarity and full-text search results using Reciprocal Rank Fusion.
+        Hybrid search that returns **documents** (not individual chunks).
+
+        Each returned item is a document-grouped dict that preserves real DB chunk IDs so
+        downstream agents can cite with `[citation:<chunk_id>]`.
 
         Args:
             query_text: The search query text
-            top_k: Number of results to return
+            top_k: Number of documents to return
             search_space_id: The search space ID to search within
             document_type: Optional document type to filter results (e.g., "FILE", "CRAWLED_URL")
+            start_date: Optional start date for filtering documents by updated_at
+            end_date: Optional end date for filtering documents by updated_at
+            query_embedding: Pre-computed embedding vector. If None, will be computed here.
 
         Returns:
-            List of dictionaries containing chunk data and relevance scores
+            List of dictionaries containing document data and relevance scores. Each dict contains:
+              - chunk_id: a "primary" chunk id for compatibility (best-ranked chunk for the doc)
+              - content: concatenated chunk content (useful for reranking)
+              - chunks: list[{chunk_id, content}] for citation-aware prompting
+              - document: {id, title, document_type, metadata}
         """
         from sqlalchemy import func, select, text
         from sqlalchemy.orm import joinedload
@@ -123,13 +189,21 @@ class ChucksHybridSearchRetriever:
         from app.config import config
         from app.db import Chunk, Document, DocumentType
 
-        # Get embedding for the query
-        embedding_model = config.embedding_model_instance
-        query_embedding = embedding_model.embed(query_text)
+        perf = get_perf_logger()
+        t0 = time.perf_counter()
 
-        # Constants for RRF calculation
-        k = 60  # Constant for RRF calculation
-        n_results = top_k * 2  # Get more results for better fusion
+        if query_embedding is None:
+            embedding_model = config.embedding_model_instance
+            t_embed = time.perf_counter()
+            query_embedding = embedding_model.embed(query_text)
+            perf.debug(
+                "[chunk_search] hybrid_search embedding in %.3fs",
+                time.perf_counter() - t_embed,
+            )
+
+        # RRF constants
+        k = 60
+        n_results = top_k * 5  # Fetch extra chunks for better document-level fusion
 
         # Create tsvector and tsquery for PostgreSQL full-text search
         tsvector = func.to_tsvector("english", Chunk.content)
@@ -150,6 +224,12 @@ class ChucksHybridSearchRetriever:
                     return []
             else:
                 base_conditions.append(Document.document_type == document_type)
+
+        # Add time-based filtering if provided
+        if start_date is not None:
+            base_conditions.append(Document.updated_at >= start_date)
+        if end_date is not None:
+            base_conditions.append(Document.updated_at <= end_date)
 
         # CTE for semantic search filtered by search space
         semantic_search_cte = (
@@ -214,18 +294,26 @@ class ChucksHybridSearchRetriever:
             .limit(top_k)
         )
 
-        # Execute the query
+        # Execute the RRF query
+        t_rrf = time.perf_counter()
         result = await self.db_session.execute(final_query)
         chunks_with_scores = result.all()
+        perf.info(
+            "[chunk_search] hybrid_search RRF query in %.3fs results=%d space=%d type=%s",
+            time.perf_counter() - t_rrf,
+            len(chunks_with_scores),
+            search_space_id,
+            document_type,
+        )
 
         # If no results were found, return an empty list
         if not chunks_with_scores:
             return []
 
-        # Convert to serializable dictionaries if no reranker is available or if reranking failed
-        serialized_results = []
+        # Convert to serializable dictionaries
+        serialized_chunk_results: list[dict] = []
         for chunk, score in chunks_with_scores:
-            serialized_results.append(
+            serialized_chunk_results.append(
                 {
                     "chunk_id": chunk.id,
                     "content": chunk.content,
@@ -241,4 +329,98 @@ class ChucksHybridSearchRetriever:
                 }
             )
 
-        return serialized_results
+        # Group by document, preserving ranking order by best chunk rank
+        doc_scores: dict[int, float] = {}
+        doc_order: list[int] = []
+        for item in serialized_chunk_results:
+            doc_id = item.get("document", {}).get("id")
+            if doc_id is None:
+                continue
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = item.get("score", 0.0)
+                doc_order.append(doc_id)
+            else:
+                # Use the best score as doc score
+                doc_scores[doc_id] = max(doc_scores[doc_id], item.get("score", 0.0))
+
+        # Keep only top_k documents by initial rank order.
+        doc_ids = doc_order[:top_k]
+        if not doc_ids:
+            return []
+
+        # Fetch chunks for selected documents.  We cap per document to avoid
+        # loading hundreds of chunks for a single large file while still
+        # ensuring the chunks that matched the RRF query are always included.
+        chunk_query = (
+            select(Chunk)
+            .options(joinedload(Chunk.document))
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Document.id.in_(doc_ids))
+            .where(*base_conditions)
+            .order_by(Chunk.document_id, Chunk.id)
+        )
+        chunks_result = await self.db_session.execute(chunk_query)
+        raw_chunks = chunks_result.scalars().all()
+
+        matched_chunk_ids: set[int] = {
+            item["chunk_id"] for item in serialized_chunk_results
+        }
+
+        doc_chunk_counts: dict[int, int] = {}
+        all_chunks: list = []
+        for chunk in raw_chunks:
+            did = chunk.document_id
+            count = doc_chunk_counts.get(did, 0)
+            if chunk.id in matched_chunk_ids or count < _MAX_FETCH_CHUNKS_PER_DOC:
+                all_chunks.append(chunk)
+                doc_chunk_counts[did] = count + 1
+
+        # Assemble final doc-grouped results in the same order as doc_ids
+        doc_map: dict[int, dict] = {
+            doc_id: {
+                "document_id": doc_id,
+                "content": "",
+                "score": float(doc_scores.get(doc_id, 0.0)),
+                "chunks": [],
+                "document": {},
+                "source": None,
+            }
+            for doc_id in doc_ids
+        }
+
+        for chunk in all_chunks:
+            doc = chunk.document
+            doc_id = doc.id
+            if doc_id not in doc_map:
+                continue
+            doc_entry = doc_map[doc_id]
+            doc_entry["document"] = {
+                "id": doc.id,
+                "title": doc.title,
+                "document_type": doc.document_type.value
+                if getattr(doc, "document_type", None)
+                else None,
+                "metadata": doc.document_metadata or {},
+            }
+            doc_entry["source"] = (
+                doc.document_type.value if getattr(doc, "document_type", None) else None
+            )
+            doc_entry["chunks"].append({"chunk_id": chunk.id, "content": chunk.content})
+
+        # Fill concatenated content (useful for reranking)
+        final_docs: list[dict] = []
+        for doc_id in doc_ids:
+            entry = doc_map[doc_id]
+            entry["content"] = "\n\n".join(
+                c["content"] for c in entry.get("chunks", []) if c.get("content")
+            )
+            final_docs.append(entry)
+
+        perf.info(
+            "[chunk_search] hybrid_search TOTAL in %.3fs docs=%d space=%d type=%s",
+            time.perf_counter() - t0,
+            len(final_docs),
+            search_space_id,
+            document_type,
+        )
+        return final_docs

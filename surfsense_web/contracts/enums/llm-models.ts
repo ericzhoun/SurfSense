@@ -179,6 +179,18 @@ export const LLM_MODELS: LLMModel[] = [
 
 	// Google (Gemini)
 	{
+		value: "gemini-3-flash-preview",
+		label: "Gemini 3 Flash",
+		provider: "GOOGLE",
+		contextWindow: "1M",
+	},
+	{
+		value: "gemini-3-pro-preview",
+		label: "Gemini 3 Pro",
+		provider: "GOOGLE",
+		contextWindow: "1M",
+	},
+	{
 		value: "gemini-2.5-flash",
 		label: "Gemini 2.5 Flash",
 		provider: "GOOGLE",
@@ -245,30 +257,6 @@ export const LLM_MODELS: LLMModel[] = [
 		label: "DeepSeek Coder",
 		provider: "DEEPSEEK",
 		contextWindow: "128K",
-	},
-	{
-		value: "deepseek-chat",
-		label: "DeepSeek Chat V3",
-		provider: "DEEPSEEK",
-		contextWindow: "66K",
-	},
-	{
-		value: "deepseek-v3",
-		label: "DeepSeek V3",
-		provider: "DEEPSEEK",
-		contextWindow: "66K",
-	},
-	{
-		value: "deepseek-r1",
-		label: "DeepSeek R1",
-		provider: "DEEPSEEK",
-		contextWindow: "66K",
-	},
-	{
-		value: "deepseek-r1-0528",
-		label: "DeepSeek R1 (0528)",
-		provider: "DEEPSEEK",
-		contextWindow: "65K",
 	},
 
 	// xAI (Grok)
@@ -1122,7 +1110,7 @@ export const LLM_MODELS: LLMModel[] = [
 		contextWindow: "8K",
 	},
 	{
-		value: "mixtral-8x7B-Instruct-v0.1",
+		value: "mixtral",
 		label: "Ollama Mixtral 8x7B",
 		provider: "OLLAMA",
 		contextWindow: "33K",
@@ -1224,13 +1212,13 @@ export const LLM_MODELS: LLMModel[] = [
 
 	// Zhipu (GLM)
 	{
-		value: "z-ai/glm-4.6",
+		value: "glm-4.6",
 		label: "GLM 4.6",
 		provider: "ZHIPU",
 		contextWindow: "203K",
 	},
 	{
-		value: "z-ai/glm-4.6:exacto",
+		value: "glm-4.6:exacto",
 		label: "GLM 4.6 Exacto",
 		provider: "ZHIPU",
 		contextWindow: "203K",
@@ -1338,7 +1326,7 @@ export const LLM_MODELS: LLMModel[] = [
 		contextWindow: "128K",
 	},
 	{
-		value: "openai/gpt-oss-120b",
+		value: "gpt-oss-120b",
 		label: "Cerebras GPT-OSS-120B",
 		provider: "CEREBRAS",
 		contextWindow: "131K",
@@ -1464,6 +1452,78 @@ export const LLM_MODELS: LLMModel[] = [
 		label: "Databricks Llama 4 Maverick",
 		provider: "DATABRICKS",
 		contextWindow: "128K",
+	},
+
+	// GitHub Models
+	{
+		value: "openai/gpt-5",
+		label: "GitHub GPT-5",
+		provider: "GITHUB_MODELS",
+	},
+	{
+		value: "openai/gpt-4.1",
+		label: "GitHub GPT-4.1",
+		provider: "GITHUB_MODELS",
+		contextWindow: "1048K",
+	},
+	{
+		value: "openai/gpt-4o",
+		label: "GitHub GPT-4o",
+		provider: "GITHUB_MODELS",
+		contextWindow: "128K",
+	},
+	{
+		value: "deepseek/DeepSeek-V3-0324",
+		label: "GitHub DeepSeek V3",
+		provider: "GITHUB_MODELS",
+		contextWindow: "64K",
+	},
+	{
+		value: "xai/grok-3",
+		label: "GitHub Grok 3",
+		provider: "GITHUB_MODELS",
+		contextWindow: "131K",
+	},
+	{
+		value: "openai/gpt-5-mini",
+		label: "GitHub GPT-5 Mini",
+		provider: "GITHUB_MODELS",
+	},
+	{
+		value: "openai/gpt-4.1-mini",
+		label: "GitHub GPT-4.1 Mini",
+		provider: "GITHUB_MODELS",
+		contextWindow: "1048K",
+	},
+	{
+		value: "meta/Llama-4-Scout-17B-16E-Instruct",
+		label: "GitHub Llama 4 Scout",
+		provider: "GITHUB_MODELS",
+		contextWindow: "512K",
+	},
+	{
+		value: "openai/gpt-4.1-nano",
+		label: "GitHub GPT-4.1 Nano",
+		provider: "GITHUB_MODELS",
+		contextWindow: "1048K",
+	},
+	{
+		value: "openai/gpt-4o-mini",
+		label: "GitHub GPT-4o Mini",
+		provider: "GITHUB_MODELS",
+		contextWindow: "128K",
+	},
+	{
+		value: "openai/o4-mini",
+		label: "GitHub O4 Mini",
+		provider: "GITHUB_MODELS",
+		contextWindow: "200K",
+	},
+	{
+		value: "deepseek/DeepSeek-R1",
+		label: "GitHub DeepSeek R1",
+		provider: "GITHUB_MODELS",
+		contextWindow: "64K",
 	},
 ];
 

@@ -8,12 +8,14 @@ import { useTranslations } from "next-intl";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { loginMutationAtom } from "@/atoms/auth/auth-mutation.atoms";
-import { getAuthErrorDetails, isNetworkError, shouldRetry } from "@/lib/auth-errors";
+import { Spinner } from "@/components/ui/spinner";
+import { getAuthErrorDetails, isNetworkError } from "@/lib/auth-errors";
+import { AUTH_TYPE } from "@/lib/env-config";
 import { ValidationError } from "@/lib/error";
+import { trackLoginAttempt, trackLoginFailure, trackLoginSuccess } from "@/lib/posthog/events";
 
 export function LocalLoginForm() {
 	const t = useTranslations("auth");
-	const tCommon = useTranslations("common");
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
 	const [showPassword, setShowPassword] = useState(false);
@@ -29,16 +31,16 @@ export function LocalLoginForm() {
 	const [{ mutateAsync: login, isPending: isLoggingIn }] = useAtom(loginMutationAtom);
 
 	useEffect(() => {
-		// Get the auth type from environment variables
-		setAuthType(process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "GOOGLE");
+		// Get the auth type from centralized config
+		setAuthType(AUTH_TYPE);
 	}, []);
 
 	const handleSubmit = async (e: React.FormEvent) => {
 		e.preventDefault();
 		setError({ title: null, message: null }); // Clear any previous errors
 
-		// Show loading toast
-		const loadingToast = toast.loading(tCommon("loading"));
+		// Track login attempt
+		trackLoginAttempt("local");
 
 		try {
 			const data = await login({
@@ -47,12 +49,13 @@ export function LocalLoginForm() {
 				grant_type: "password",
 			});
 
-			// Success toast
-			toast.success(t("login_success"), {
-				id: loadingToast,
-				description: "Redirecting to dashboard...",
-				duration: 2000,
-			});
+			// Track successful login
+			trackLoginSuccess("local");
+
+			// Set flag so TokenHandler knows local login was already tracked
+			if (typeof window !== "undefined") {
+				sessionStorage.setItem("login_success_tracked", "true");
+			}
 
 			// Small delay to show success message
 			setTimeout(() => {
@@ -60,12 +63,8 @@ export function LocalLoginForm() {
 			}, 500);
 		} catch (err) {
 			if (err instanceof ValidationError) {
+				trackLoginFailure("local", err.message);
 				setError({ title: err.name, message: err.message });
-				toast.error(err.name, {
-					id: loadingToast,
-					description: err.message,
-					duration: 6000,
-				});
 				return;
 			}
 
@@ -78,6 +77,9 @@ export function LocalLoginForm() {
 				errorCode = "NETWORK_ERROR";
 			}
 
+			// Track login failure
+			trackLoginFailure("local", errorCode);
+
 			// Get detailed error information from auth-errors utility
 			const errorDetails = getAuthErrorDetails(errorCode);
 
@@ -86,32 +88,15 @@ export function LocalLoginForm() {
 				title: errorDetails.title,
 				message: errorDetails.description,
 			});
-
-			// Show error toast with conditional retry action
-			const toastOptions: any = {
-				id: loadingToast,
-				description: errorDetails.description,
-				duration: 6000,
-			};
-
-			// Add retry action if the error is retryable
-			if (shouldRetry(errorCode)) {
-				toastOptions.action = {
-					label: "Retry",
-					onClick: () => handleSubmit(e),
-				};
-			}
-
-			toast.error(errorDetails.title, toastOptions);
 		}
 	};
 
 	return (
-		<div className="w-full max-w-md">
-			<form onSubmit={handleSubmit} className="space-y-4">
+		<div className="w-full max-w-md px-6 md:px-0">
+			<form onSubmit={handleSubmit} className="space-y-3 md:space-y-4">
 				{/* Error Display */}
 				<AnimatePresence>
-					{error && error.title && (
+					{error?.title && (
 						<motion.div
 							initial={{ opacity: 0, y: -10, scale: 0.95 }}
 							animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -183,7 +168,7 @@ export function LocalLoginForm() {
 						required
 						value={username}
 						onChange={(e) => setUsername(e.target.value)}
-						className={`mt-1 block w-full rounded-md border px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-colors ${
+						className={`mt-1 block w-full rounded-md border px-3 py-1.5 md:py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-all ${
 							error.title
 								? "border-red-300 focus:border-red-500 focus:ring-red-500 dark:border-red-700"
 								: "border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-700"
@@ -206,7 +191,7 @@ export function LocalLoginForm() {
 							required
 							value={password}
 							onChange={(e) => setPassword(e.target.value)}
-							className={`mt-1 block w-full rounded-md border pr-10 px-3 py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-colors ${
+							className={`mt-1 block w-full rounded-md border pr-10 px-3 py-1.5 md:py-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 dark:bg-gray-800 dark:text-white transition-all ${
 								error.title
 									? "border-red-300 focus:border-red-500 focus:ring-red-500 dark:border-red-700"
 									: "border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-700"
@@ -227,9 +212,16 @@ export function LocalLoginForm() {
 				<button
 					type="submit"
 					disabled={isLoggingIn}
-					className="w-full rounded-md bg-blue-600 px-4 py-2 text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
+					className="w-full rounded-md bg-blue-600 px-4 py-1.5 md:py-2 text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 transition-all text-sm md:text-base flex items-center justify-center gap-2"
 				>
-					{isLoggingIn ? tCommon("loading") : t("sign_in")}
+					{isLoggingIn ? (
+						<>
+							<Spinner size="sm" className="text-white" />
+							<span>{t("signing_in")}</span>
+						</>
+					) : (
+						t("sign_in")
+					)}
 				</button>
 			</form>
 
